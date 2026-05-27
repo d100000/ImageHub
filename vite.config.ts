@@ -4467,6 +4467,7 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 8877,
     strictPort: true,
+    allowedHosts: ["imagehub.taijiai.online"],
   },
   preview: {
     host: "0.0.0.0",
