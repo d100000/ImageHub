@@ -7289,6 +7289,15 @@ textarea:focus-visible {
 .login-option-oauth {
   border-color: rgba(59, 130, 246, 0.3);
   background: rgba(59, 130, 246, 0.04);
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+  padding: 14px;
+}
+
+.login-option-oauth div {
+  align-items: center;
 }
 
 .login-option-oauth:hover {
