@@ -642,9 +642,9 @@ const SQUARE_FEED_TABS: Array<{ value: SquareFeedTab; label: string; icon: typeo
 const CURRENT_FRONTEND_VERSION = typeof __FRONTEND_BUILD_VERSION__ === "string"
   ? __FRONTEND_BUILD_VERSION__
   : "dev";
-const ALLOWED_API_ENDPOINTS = [
+const ALLOWED_API_ENDPOINTS: { value: string; label: string; description: string }[] = [
   {
-    value: "https://api.naichuan.cn",
+    value: "https://www.taijiai.online/",
     label: "太极 AI",
     description: "主服务地址",
   },
@@ -653,7 +653,7 @@ const ALLOWED_API_ENDPOINTS = [
     label: "BobDong",
     description: "备用服务地址",
   },
-] as const;
+];
 const DEFAULT_API_URL = ALLOWED_API_ENDPOINTS[0].value;
 const DEFAULT_PROTOCOL: ImageProtocol = "custom-openai";
 const DEFAULT_IMAGE_RESOLUTION: ImageResolution = "1K";
@@ -3399,16 +3399,31 @@ export default function App() {
     (async () => {
       try {
         const cfgRes = await fetch("/api/auth/oauth/config");
-        const cfg = await cfgRes.json() as { enabled?: boolean };
+        const cfg = await cfgRes.json() as { enabled?: boolean; providerUrl?: string };
         if (cancelled) return;
         if (!cfg.enabled) { setOauthChecked(true); return; }
         setOauthEnabled(true);
+        if (cfg.providerUrl) {
+          const normalized = cfg.providerUrl.replace(/\/+$/, "");
+          if (!ALLOWED_API_ENDPOINTS.some((ep) => ep.value.replace(/\/+$/, "") === normalized)) {
+            ALLOWED_API_ENDPOINTS.push({ value: normalized, label: "太极 AI (OAuth)", description: "OAuth 登录服务地址" });
+          }
+        }
 
         const meRes = await fetch("/api/auth/oauth/me", { credentials: "same-origin" });
-        const me = await meRes.json() as { loggedIn?: boolean; sub?: string; username?: string; displayName?: string; email?: string; role?: number; group?: string };
+        const me = await meRes.json() as { loggedIn?: boolean; sub?: string; username?: string; displayName?: string; email?: string; role?: number; group?: string; apiKey?: string };
         if (cancelled) return;
         if (me.loggedIn) {
           setOauthUser({ sub: me.sub || "", username: me.username || "", displayName: me.displayName || "", email: me.email || "", role: me.role ?? 1, group: me.group || "" });
+          if (me.apiKey) {
+            const baseUrl = cfg.providerUrl || "";
+            setApiConfig((prev) => ({
+              ...prev,
+              apiKey: me.apiKey!,
+              baseUrl: normalizeApiBaseUrl(baseUrl) || prev.baseUrl,
+              rememberKey: true,
+            }));
+          }
         } else if (hash === "#oauth-error") {
           window.alert("登录失败，请重试");
         }

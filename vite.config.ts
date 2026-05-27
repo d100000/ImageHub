@@ -270,7 +270,7 @@ const GPT_IMAGE_2_PRO_MODEL = "gpt-image-2-pro";
 const GPT_IMAGE_2_FAMILY_MODEL = "gpt-5.4-image-2";
 const GEMINI_3_PRO_IMAGE_MODEL = "gemini-3-pro-image-preview";
 const GEMINI_NATIVE_API_PREFIX = "/v1beta";
-const ALLOWED_API_BASE_URLS = ["https://api.naichuan.cn"];
+const ALLOWED_API_BASE_URLS: string[] = ["https://www.taijiai.online/", "https://bobdong.cn/"];
 const SESSION_COOKIE = "image_studio_admin_session";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 8;
 const DATA_DIR = join(process.cwd(), ".data");
@@ -287,6 +287,9 @@ const OAUTH_ENABLED = OAUTH_CLIENT_ID.length > 0 && OAUTH_CLIENT_SECRET.length >
 const OAUTH_SESSION_COOKIE = "imagehub_oauth_session";
 const OAUTH_SESSION_TTL_MS = 1000 * 60 * 60 * 24;
 const OAUTH_STATE_TTL_MS = 1000 * 60 * 10;
+if (OAUTH_ENABLED && OAUTH_PROVIDER_URL && !ALLOWED_API_BASE_URLS.some((url) => url.replace(/\/+$/, "") === OAUTH_PROVIDER_URL)) {
+  ALLOWED_API_BASE_URLS.push(OAUTH_PROVIDER_URL);
+}
 const SQUARE_SHELF_LIMIT = 4;
 const SQUARE_DAILY_RECOMMEND_LIMIT = 10;
 const SQUARE_DAILY_LIKE_LIMIT = 10;
@@ -363,6 +366,7 @@ interface OAuthSessionData {
   email: string;
   role: number;
   group: string;
+  apiKey: string;
   expiresAt: number;
 }
 const oauthSessions = new Map<string, OAuthSessionData>();
@@ -3560,6 +3564,7 @@ function imageProxyPlugin(): PluginOption {
             sendJson(res, 200, {
               enabled: OAUTH_ENABLED,
               providerName: OAUTH_ENABLED ? "太极AI" : undefined,
+              providerUrl: OAUTH_ENABLED ? OAUTH_PROVIDER_URL : undefined,
             });
             return;
           }
@@ -3631,9 +3636,14 @@ function imageProxyPlugin(): PluginOption {
               return;
             }
 
-            const userInfoRes = await fetchWithTimeout(`${OAUTH_PROVIDER_URL}/oauth2/userinfo`, {
-              headers: { Authorization: `Bearer ${tokenData.access_token}` },
-            }, 15_000);
+            const [userInfoRes, apikeyRes] = await Promise.all([
+              fetchWithTimeout(`${OAUTH_PROVIDER_URL}/oauth2/userinfo`, {
+                headers: { Authorization: `Bearer ${tokenData.access_token}` },
+              }, 15_000),
+              fetchWithTimeout(`${OAUTH_PROVIDER_URL}/oauth2/apikey`, {
+                headers: { Authorization: `Bearer ${tokenData.access_token}` },
+              }, 15_000).catch(() => null),
+            ]);
 
             const userInfo = await userInfoRes.json() as {
               sub?: string; username?: string; display_name?: string;
@@ -3646,6 +3656,15 @@ function imageProxyPlugin(): PluginOption {
               return;
             }
 
+            let apiKey = "";
+            if (apikeyRes) {
+              try {
+                const apikeyData = await apikeyRes.json() as Record<string, unknown>;
+                console.log("[OAuth] /oauth2/apikey response:", JSON.stringify(apikeyData));
+                apiKey = String(apikeyData.api_key || apikeyData.apiKey || apikeyData.key || "");
+              } catch { /* ignore */ }
+            }
+
             const sessionToken = createOAuthSession({
               sub: String(userInfo.sub),
               username: userInfo.username || "",
@@ -3653,6 +3672,7 @@ function imageProxyPlugin(): PluginOption {
               email: userInfo.email || "",
               role: userInfo.role ?? 1,
               group: userInfo.group || "default",
+              apiKey,
             });
             setOAuthCookie(res, sessionToken);
             res.statusCode = 302;
@@ -3675,6 +3695,7 @@ function imageProxyPlugin(): PluginOption {
               email: session.email,
               role: session.role,
               group: session.group,
+              apiKey: session.apiKey || undefined,
             });
             return;
           }
@@ -4451,6 +4472,6 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 5173,
     strictPort: true,
-    allowedHosts: ["image.naichuan.cn"],
+    allowedHosts: ["image.taijiai.online"],
   },
 });
