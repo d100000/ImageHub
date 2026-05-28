@@ -1990,7 +1990,7 @@ function mergeHistoricalJobs(current: Job[], incoming: Job[]) {
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 2);
+    const request = indexedDB.open(DB_NAME, 3);
     request.onupgradeneeded = () => {
       const db = request.result;
       const store = db.objectStoreNames.contains(STORE_NAME)
@@ -2001,7 +2001,15 @@ function openDb(): Promise<IDBDatabase> {
       }
     };
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onerror = () => {
+      if (request.error?.name === "VersionError") {
+        const retry = indexedDB.open(DB_NAME);
+        retry.onsuccess = () => resolve(retry.result);
+        retry.onerror = () => reject(retry.error);
+      } else {
+        reject(request.error);
+      }
+    };
   });
 }
 
