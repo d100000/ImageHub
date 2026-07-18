@@ -432,7 +432,7 @@ type PreviewItem = {
   submittedReferenceImages?: SubmittedReference[];
 };
 
-type AppPage = "home" | "studio" | "square" | "admin";
+type AppPage = "home" | "studio" | "square" | "admin" | "canvas";
 
 type SquareFeedTab = "latest" | "hot" | "top_day" | "top_week" | "top_month";
 
@@ -617,6 +617,46 @@ type AdminStats = {
   errorCounts: Record<string, number>;
 };
 
+// ── Canvas Mode Types ──
+
+type CanvasNodeStatus = "generating" | "success" | "error";
+
+type CanvasNode = {
+  id: string;
+  type: "image";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  prompt: string;
+  model: string;
+  protocol: ImageProtocol;
+  params: ImageParams;
+  status: CanvasNodeStatus;
+  error?: string;
+  parentId?: string;
+  referenceNodeId?: string;
+  createdAt: number;
+  duration?: number;
+  imageWidth?: number;
+  imageHeight?: number;
+  objectUrl?: string;
+};
+
+type CanvasEdge = {
+  id: string;
+  fromNodeId: string;
+  toNodeId: string;
+};
+
+type CanvasViewport = {
+  x: number;
+  y: number;
+  zoom: number;
+};
+
+type CanvasPanelMode = "generate" | "optimize";
+
 const DB_NAME = "codex-image-batch-studio";
 const STORE_NAME = "history";
 const HISTORY_PAGE_SIZE = 20;
@@ -632,6 +672,11 @@ const FRONTEND_VERSION_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const API_KEY_MIN_LENGTH = 8;
 const AGENT_MODE_STORAGE_KEY = "imageStudioAgentModeEnabled";
 const AGENT_MODE_NAME = "Agent 模式 A";
+const CANVAS_STATE_STORE = "canvas-state";
+const CANVAS_IMAGES_STORE = "canvas-images";
+const CANVAS_STATE_KEY = "current";
+const CANVAS_SAVE_DEBOUNCE_MS = 500;
+const CANVAS_DEFAULT_NODE_WIDTH = 280;
 const SQUARE_FEED_TABS: Array<{ value: SquareFeedTab; label: string; icon: typeof Clock3 }> = [
   { value: "latest", label: "最新", icon: Clock3 },
   { value: "hot", label: "热门", icon: Flame },
@@ -676,6 +721,8 @@ const ASPECT_RATIOS = [
   { value: "16:9", label: "16:9 宽屏", hint: "视频封面、网页头图、桌面壁纸" },
   { value: "21:9", label: "21:9 超宽屏", hint: "横幅、电影感场景" },
   { value: "9:21", label: "9:21 长竖屏", hint: "长屏海报、移动端素材" },
+  { value: "12:5", label: "12:5 4K 超宽", hint: "GPT Image 2 4K 超宽输出尺寸 3840x1600" },
+  { value: "5:12", label: "5:12 4K 超高", hint: "GPT Image 2 4K 超高输出尺寸 1600x3840" },
   { value: "4:1", label: "4:1 横幅", hint: "Banner、页面横幅" },
   { value: "1:4", label: "1:4 长图", hint: "竖向长图、信息流素材" },
   { value: "8:1", label: "8:1 超横幅", hint: "超宽展示屏、高级模式" },
@@ -684,7 +731,7 @@ const ASPECT_RATIOS = [
 
 const ALL_ASPECT_RATIOS = ASPECT_RATIOS.map((ratio) => ratio.value);
 const GPT_IMAGE_SUPPORTED_ASPECT_RATIOS = ["1:1", "2:3", "3:2"] as const;
-const GPT_IMAGE_2_PRO_SUPPORTED_ASPECT_RATIOS = ["1:1", "4:5", "5:4", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9", "21:9"] as const;
+const GPT_IMAGE_2_PRO_1K_SUPPORTED_ASPECT_RATIOS = ["1:1", "4:5", "5:4", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9", "21:9"] as const;
 const GEMINI_3_PRO_SUPPORTED_ASPECT_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"] as const;
 
 const IMAGEN_ASPECT_RATIOS = ["1:1", "3:4", "4:3", "9:16", "16:9"];
@@ -703,37 +750,41 @@ const SIZE_BY_RATIO: Record<string, string> = {
   "16:9": "1792x1024",
   "21:9": "2016x864",
   "9:21": "864x2016",
+  "12:5": "2016x840",
+  "5:12": "840x2016",
   "4:1": "2048x512",
   "1:4": "512x2048",
   "8:1": "2048x256",
   "1:8": "256x2048",
 };
 
-const PRO_2K_SIZE_BY_RATIO: Record<string, string> = {
-  "1:1": "2048x2048",
-  "4:5": "2048x2560",
-  "5:4": "2560x2048",
-  "3:4": "2304x3072",
-  "4:3": "3072x2304",
-  "2:3": "2048x3072",
-  "3:2": "3072x2048",
-  "9:16": "2160x3840",
-  "16:9": "3840x2160",
-  "21:9": "3840x1646",
-};
+const GPT_IMAGE_2_SIZE_OPTIONS: Array<{
+  size: string;
+  aspectRatio: string;
+  resolution: Exclude<ImageResolution, "1K">;
+  label: string;
+}> = [
+  { size: "2560x1440", aspectRatio: "16:9", resolution: "2K", label: "2K QHD 横屏" },
+  { size: "1440x2560", aspectRatio: "9:16", resolution: "2K", label: "2K QHD 竖屏" },
+  { size: "2048x1152", aspectRatio: "16:9", resolution: "2K", label: "2K 16:9 横屏" },
+  { size: "1152x2048", aspectRatio: "9:16", resolution: "2K", label: "2K 9:16 竖屏" },
+  { size: "2048x2048", aspectRatio: "1:1", resolution: "2K", label: "2K 方图" },
+  { size: "2048x1536", aspectRatio: "4:3", resolution: "2K", label: "2K 4:3 横图" },
+  { size: "1536x2048", aspectRatio: "3:4", resolution: "2K", label: "2K 3:4 竖图" },
+  { size: "2048x3072", aspectRatio: "2:3", resolution: "2K", label: "2K 2:3 竖图" },
+  { size: "3072x2048", aspectRatio: "3:2", resolution: "2K", label: "2K 3:2 横图" },
+  { size: "3840x2160", aspectRatio: "16:9", resolution: "4K", label: "4K UHD 横屏" },
+  { size: "2160x3840", aspectRatio: "9:16", resolution: "4K", label: "4K UHD 竖屏" },
+  { size: "3840x1600", aspectRatio: "12:5", resolution: "4K", label: "4K 超宽" },
+  { size: "1600x3840", aspectRatio: "5:12", resolution: "4K", label: "4K 超高" },
+];
 
-const PRO_4K_SIZE_BY_RATIO: Record<string, string> = {
-  "1:1": "3840x3840",
-  "4:5": "3072x3840",
-  "5:4": "3840x3072",
-  "3:4": "2880x3840",
-  "4:3": "3840x2880",
-  "2:3": "2560x3840",
-  "3:2": "3840x2560",
-  "9:16": "2160x3840",
-  "16:9": "3840x2160",
-  "21:9": "3840x1646",
-};
+const GPT_IMAGE_2_2K_SUPPORTED_ASPECT_RATIOS = [...new Set(
+  GPT_IMAGE_2_SIZE_OPTIONS.filter((option) => option.resolution === "2K").map((option) => option.aspectRatio),
+)];
+const GPT_IMAGE_2_4K_SUPPORTED_ASPECT_RATIOS = [...new Set(
+  GPT_IMAGE_2_SIZE_OPTIONS.filter((option) => option.resolution === "4K").map((option) => option.aspectRatio),
+)];
 
 const GEMINI_3_PRO_SIZE_BY_RATIO: Record<string, string> = {
   "1:1": "1024x1024",
@@ -1419,6 +1470,7 @@ function getClientId() {
 function pageFromHash(): AppPage {
   if (window.location.hash === "#studio") return "studio";
   if (window.location.hash === "#square") return "square";
+  if (window.location.hash === "#canvas") return "canvas";
   if (window.location.hash.startsWith("#admin")) return "admin";
   return "home";
 }
@@ -1671,6 +1723,11 @@ function isGptImage2ProModel(model = "") {
   return normalizedImageModelId(model) === GPT_IMAGE_2_PRO_MODEL;
 }
 
+function supportsGptImage2ExplicitSizes(model = "") {
+  const normalized = normalizedImageModelId(model);
+  return normalized === GPT_IMAGE_2_MODEL || normalized === GPT_IMAGE_2_PRO_MODEL;
+}
+
 function isGemini3ProImageModel(model = "") {
   return normalizedImageModelId(model) === GEMINI_3_PRO_IMAGE_MODEL;
 }
@@ -1698,19 +1755,43 @@ function imageModelLaneLabel(model: string) {
 }
 
 function usesOfficialGptImageSizing(protocol: ImageProtocol, model = "") {
-  return isGptImage2Model(model) && !isGptImage2ProModel(model) && (
+  return isGptImage2Model(model) && !supportsGptImage2ExplicitSizes(model) && (
     protocol === "custom-openai"
     || protocol === "openai-images"
     || protocol === "openai-responses"
   );
 }
 
-function getSupportedAspectRatios(protocol: ImageProtocol, model = "") {
+function gptImage2SizeOptionsForResolution(resolution: ImageResolution) {
+  return GPT_IMAGE_2_SIZE_OPTIONS.filter((option) => option.resolution === resolution);
+}
+
+function gptImage2SizeOptionForSize(size = "") {
+  return GPT_IMAGE_2_SIZE_OPTIONS.find((option) => option.size === size);
+}
+
+function gptImage2DefaultSizeOption(aspectRatio: string, resolution: ImageResolution) {
+  const options = gptImage2SizeOptionsForResolution(resolution);
+  return options.find((option) => option.aspectRatio === aspectRatio) || options[0];
+}
+
+function explicitSizeOptionsForModel(model: string, resolution: ImageResolution) {
+  return supportsGptImage2ExplicitSizes(model) ? gptImage2SizeOptionsForResolution(resolution) : [];
+}
+
+function getSupportedAspectRatios(
+  protocol: ImageProtocol,
+  model = "",
+  resolution: ImageResolution = DEFAULT_IMAGE_RESOLUTION,
+) {
   if (isGemini3ProImageModel(model) && protocol === "gemini-native") {
     return [...GEMINI_3_PRO_SUPPORTED_ASPECT_RATIOS];
   }
-  if (isGptImage2ProModel(model)) {
-    return [...GPT_IMAGE_2_PRO_SUPPORTED_ASPECT_RATIOS];
+  if (supportsGptImage2ExplicitSizes(model)) {
+    const res = safeImageResolution(resolution);
+    if (res === "4K") return [...GPT_IMAGE_2_4K_SUPPORTED_ASPECT_RATIOS];
+    if (res === "2K") return [...GPT_IMAGE_2_2K_SUPPORTED_ASPECT_RATIOS];
+    return [...GPT_IMAGE_2_PRO_1K_SUPPORTED_ASPECT_RATIOS];
   }
   if (usesOfficialGptImageSizing(protocol, model)) {
     return [...GPT_IMAGE_SUPPORTED_ASPECT_RATIOS];
@@ -1718,8 +1799,13 @@ function getSupportedAspectRatios(protocol: ImageProtocol, model = "") {
   return getProtocolDefinition(protocol).supportedAspectRatios;
 }
 
-function isAspectRatioSupported(protocol: ImageProtocol, aspectRatio: string, model = "") {
-  return getSupportedAspectRatios(protocol, model).includes(aspectRatio);
+function isAspectRatioSupported(
+  protocol: ImageProtocol,
+  aspectRatio: string,
+  model = "",
+  resolution: ImageResolution = DEFAULT_IMAGE_RESOLUTION,
+) {
+  return getSupportedAspectRatios(protocol, model, resolution).includes(aspectRatio);
 }
 
 function isImageResolution(value: unknown): value is ImageResolution {
@@ -1763,13 +1849,18 @@ function resolveRequestSize(
   resolution: ImageResolution = DEFAULT_IMAGE_RESOLUTION,
   protocol: ImageProtocol,
   model = "",
+  preferredSize = "",
 ) {
   const baseSize = baseSizeForModel(aspectRatio, protocol, model);
   if (usesOfficialGptImageSizing(protocol, model)) return baseSize;
-  if (isGptImage2ProModel(model)) {
+  if (supportsGptImage2ExplicitSizes(model)) {
     const res = safeImageResolution(resolution);
-    if (res === "4K") return PRO_4K_SIZE_BY_RATIO[aspectRatio] || PRO_4K_SIZE_BY_RATIO["1:1"];
-    if (res === "2K") return PRO_2K_SIZE_BY_RATIO[aspectRatio] || PRO_2K_SIZE_BY_RATIO["1:1"];
+    const preferredOption = gptImage2SizeOptionForSize(preferredSize);
+    if (preferredOption && preferredOption.resolution === res && preferredOption.aspectRatio === aspectRatio) {
+      return preferredOption.size;
+    }
+    const defaultOption = gptImage2DefaultSizeOption(aspectRatio, res);
+    if (defaultOption) return defaultOption.size;
     return baseSize;
   }
   return scaleSize(baseSize, safeImageResolution(resolution));
@@ -1789,7 +1880,9 @@ function normalizeImageParams(params: Partial<ImageParams> = {}): ImageParams {
   return {
     aspectRatio,
     resolution,
-    size: resolveSize(aspectRatio, resolution),
+    size: typeof params.size === "string" && params.size.trim()
+      ? params.size.trim()
+      : resolveSize(aspectRatio, resolution),
     quality: typeof params.quality === "string" ? params.quality : "auto",
     outputFormat: params.outputFormat === "jpeg" || params.outputFormat === "webp" ? params.outputFormat : "png",
     batchCount: clampNumber(Number(params.batchCount || 4), 1, 20),
@@ -1999,6 +2092,12 @@ function openDb(): Promise<IDBDatabase> {
       if (!store.indexNames.contains("createdAt")) {
         store.createIndex("createdAt", "createdAt");
       }
+      if (!db.objectStoreNames.contains(CANVAS_STATE_STORE)) {
+        db.createObjectStore(CANVAS_STATE_STORE);
+      }
+      if (!db.objectStoreNames.contains(CANVAS_IMAGES_STORE)) {
+        db.createObjectStore(CANVAS_IMAGES_STORE);
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => {
@@ -2116,6 +2215,65 @@ async function clearHistoryRecords() {
   return new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readwrite");
     tx.objectStore(STORE_NAME).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// ── Canvas IndexedDB Persistence ──
+
+type CanvasPersistedState = {
+  nodes: Array<Omit<CanvasNode, "objectUrl">>;
+  edges: CanvasEdge[];
+  viewport: CanvasViewport;
+  lastSavedAt: number;
+};
+
+async function saveCanvasStateToDB(state: CanvasPersistedState): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CANVAS_STATE_STORE, "readwrite");
+    tx.objectStore(CANVAS_STATE_STORE).put(state, CANVAS_STATE_KEY);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadCanvasStateFromDB(): Promise<CanvasPersistedState | null> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CANVAS_STATE_STORE, "readonly");
+    const request = tx.objectStore(CANVAS_STATE_STORE).get(CANVAS_STATE_KEY);
+    request.onsuccess = () => resolve(request.result ?? null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function saveCanvasImageToDB(nodeId: string, blob: Blob): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CANVAS_IMAGES_STORE, "readwrite");
+    tx.objectStore(CANVAS_IMAGES_STORE).put(blob, nodeId);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadCanvasImageFromDB(nodeId: string): Promise<Blob | null> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CANVAS_IMAGES_STORE, "readonly");
+    const request = tx.objectStore(CANVAS_IMAGES_STORE).get(nodeId);
+    request.onsuccess = () => resolve(request.result ?? null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function deleteCanvasImageFromDB(nodeId: string): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CANVAS_IMAGES_STORE, "readwrite");
+    tx.objectStore(CANVAS_IMAGES_STORE).delete(nodeId);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
@@ -2882,7 +3040,12 @@ function buildLocalPromptAnalysis({
       fix: "切换到兼容协议或 Gemini Native。",
     });
   }
-  if (!isAspectRatioSupported(protocol, params.aspectRatio, selectedModel)) {
+  const analysisResolution = normalizeResolutionForRequest(
+    safeImageResolution(params.resolution),
+    protocol,
+    selectedModel,
+  );
+  if (!isAspectRatioSupported(protocol, params.aspectRatio, selectedModel, analysisResolution)) {
     risks.push({
       level: "high",
       title: "宽高比不兼容",
@@ -2900,17 +3063,18 @@ function buildLocalPromptAnalysis({
   }
 
   const suggestedAspectRatio = recommendAspectRatioForPrompt(trimmed, params.aspectRatio);
-  const fallbackAspectRatio = getSupportedAspectRatios(protocol, selectedModel)[0] || "1:1";
-  const nextSuggestedAspectRatio = isAspectRatioSupported(protocol, suggestedAspectRatio, selectedModel)
+  const fallbackAspectRatio = getSupportedAspectRatios(protocol, selectedModel, analysisResolution)[0] || "1:1";
+  const nextSuggestedAspectRatio = isAspectRatioSupported(protocol, suggestedAspectRatio, selectedModel, analysisResolution)
     ? suggestedAspectRatio
     : fallbackAspectRatio;
   const suggestedParams: SuggestedParams = {
     aspectRatio: nextSuggestedAspectRatio,
     size: resolveRequestSize(
       nextSuggestedAspectRatio,
-      safeImageResolution(params.resolution),
+      analysisResolution,
       protocol,
       selectedModel,
+      params.size,
     ),
     resolution: normalizeResolutionForRequest(
       safeImageResolution(params.resolution),
@@ -3285,24 +3449,29 @@ export default function App() {
   const currentApiConnectionKey = apiConnectionKey(apiConfig);
   const isModelConnectionVerified = modelState.status === "ready" && verifiedModelKey === currentApiConnectionKey;
   const isOfficialGptImageSizeMode = usesOfficialGptImageSizing(apiConfig.protocol, selectedModel);
-  const supportedAspectRatios = getSupportedAspectRatios(apiConfig.protocol, selectedModel);
-  const supportedAspectOptions = ASPECT_RATIOS.filter((ratio) => supportedAspectRatios.includes(ratio.value));
-  const selectedAspectRatio = getAspectDefinition(params.aspectRatio);
   const selectedResolution = normalizeResolutionForRequest(
     safeImageResolution(params.resolution),
     apiConfig.protocol,
     selectedModel,
   );
+  const supportedAspectRatios = getSupportedAspectRatios(apiConfig.protocol, selectedModel, selectedResolution);
+  const supportedAspectOptions = ASPECT_RATIOS.filter((ratio) => supportedAspectRatios.includes(ratio.value));
+  const selectedAspectRatio = getAspectDefinition(params.aspectRatio);
   const selectedResolutionDefinition = IMAGE_RESOLUTIONS.find((item) => item.value === selectedResolution) || IMAGE_RESOLUTIONS[0];
   const resolvedRequestSize = resolveRequestSize(
     params.aspectRatio,
     selectedResolution,
     apiConfig.protocol,
     selectedModel,
+    params.size,
   );
-  const aspectRatioSupported = isAspectRatioSupported(apiConfig.protocol, params.aspectRatio, selectedModel);
+  const explicitSizeOptions = explicitSizeOptionsForModel(selectedModel, selectedResolution);
+  const selectedExplicitSizeOption = explicitSizeOptions.find((option) => option.size === resolvedRequestSize);
+  const aspectRatioSupported = isAspectRatioSupported(apiConfig.protocol, params.aspectRatio, selectedModel, selectedResolution);
   const selectedAspectHint = isGemini3ProImageModel(selectedModel)
     ? "Gemini 3 Pro 官方支持比例"
+    : selectedExplicitSizeOption
+      ? selectedExplicitSizeOption.label
     : selectedAspectRatio.hint;
   const composerConfigSummary = `${params.batchCount}张 · ${params.aspectRatio} · ${selectedResolution}`;
   const composerConfigDetail = `${resolvedRequestSize} · ${params.quality} · ${params.outputFormat.toUpperCase()} · 并发 ${params.concurrency}`;
@@ -3565,15 +3734,15 @@ export default function App() {
       apiConfig.protocol,
       selectedModel,
     );
-    const fallbackRatio = getSupportedAspectRatios(apiConfig.protocol, selectedModel)[0] || "1:1";
-    const nextAspectRatio = isAspectRatioSupported(apiConfig.protocol, params.aspectRatio, selectedModel)
+    const fallbackRatio = getSupportedAspectRatios(apiConfig.protocol, selectedModel, normalizedResolution)[0] || "1:1";
+    const nextAspectRatio = isAspectRatioSupported(apiConfig.protocol, params.aspectRatio, selectedModel, normalizedResolution)
       ? params.aspectRatio
       : fallbackRatio;
     if (nextAspectRatio === params.aspectRatio && normalizedResolution === params.resolution) return;
     updateParams({
       aspectRatio: nextAspectRatio,
       resolution: normalizedResolution,
-      size: resolveRequestSize(nextAspectRatio, normalizedResolution, apiConfig.protocol, selectedModel),
+      size: resolveRequestSize(nextAspectRatio, normalizedResolution, apiConfig.protocol, selectedModel, params.size),
     });
   }, [apiConfig.protocol, selectedModel, params.aspectRatio, params.resolution]);
 
@@ -4948,10 +5117,6 @@ export default function App() {
     applyRecommendedParams = true,
     baseParams = params,
   ) {
-    const suggestedRatio = result.suggestedParams.aspectRatio || baseParams.aspectRatio;
-    const nextRatio = applyRecommendedParams && isAspectRatioSupported(apiConfig.protocol, suggestedRatio, selectedModel)
-      ? suggestedRatio
-      : baseParams.aspectRatio;
     const nextResolution = normalizeResolutionForRequest(
       applyRecommendedParams && result.suggestedParams.resolution
         ? safeImageResolution(result.suggestedParams.resolution)
@@ -4959,11 +5124,28 @@ export default function App() {
       apiConfig.protocol,
       selectedModel,
     );
+    const suggestedRatio = result.suggestedParams.aspectRatio || baseParams.aspectRatio;
+    const fallbackRatio =
+      getSupportedAspectRatios(apiConfig.protocol, selectedModel, nextResolution)[0] || baseParams.aspectRatio;
+    const nextRatio = applyRecommendedParams && isAspectRatioSupported(
+      apiConfig.protocol,
+      suggestedRatio,
+      selectedModel,
+      nextResolution,
+    )
+      ? suggestedRatio
+      : fallbackRatio;
     return {
       ...baseParams,
       aspectRatio: nextRatio,
       resolution: nextResolution,
-      size: resolveRequestSize(nextRatio, nextResolution, apiConfig.protocol, selectedModel),
+      size: resolveRequestSize(
+        nextRatio,
+        nextResolution,
+        apiConfig.protocol,
+        selectedModel,
+        result.suggestedParams.size || baseParams.size,
+      ),
       quality: applyRecommendedParams && protocolDefinition.supportsQuality && result.suggestedParams.quality
         ? result.suggestedParams.quality
         : baseParams.quality,
@@ -5196,13 +5378,18 @@ export default function App() {
     const batchParams = options.paramsOverride || params;
     const submittedPrompt = (options.promptOverride || prompt).trim();
     if (!submittedPrompt) return;
+    const batchResolution = normalizeResolutionForRequest(
+      safeImageResolution(batchParams.resolution),
+      apiConfig.protocol,
+      selectedModel,
+    );
     if (
       !selectedModel ||
       !isAllowedImageModel(selectedModel) ||
       !models.includes(selectedModel) ||
       !protocolMatchesImageModel(apiConfig.protocol, selectedModel) ||
       modelState.status !== "ready" ||
-      !isAspectRatioSupported(apiConfig.protocol, batchParams.aspectRatio, selectedModel)
+      !isAspectRatioSupported(apiConfig.protocol, batchParams.aspectRatio, selectedModel, batchResolution)
     ) {
       return;
     }
@@ -5215,16 +5402,13 @@ export default function App() {
       ...batchParams,
       batchCount: total,
       concurrency,
-      resolution: normalizeResolutionForRequest(
-        safeImageResolution(batchParams.resolution),
-        apiConfig.protocol,
-        selectedModel,
-      ),
+      resolution: batchResolution,
       size: resolveRequestSize(
         batchParams.aspectRatio,
-        normalizeResolutionForRequest(safeImageResolution(batchParams.resolution), apiConfig.protocol, selectedModel),
+        batchResolution,
         apiConfig.protocol,
         selectedModel,
+        batchParams.size,
       ),
     };
     const candidateReferenceImages = options.referenceImagesOverride ?? usableReferenceImages;
@@ -5255,14 +5439,14 @@ export default function App() {
 
   function buildAgentModeJobParams(spec: AgentModeJobSpec, baseParams = params): ImageParams {
     const recommendedRatio = spec.aspectRatio || recommendAspectRatioForPrompt(spec.prompt, baseParams.aspectRatio);
-    const aspectRatio = isAspectRatioSupported(apiConfig.protocol, recommendedRatio, selectedModel)
-      ? recommendedRatio
-      : getSupportedAspectRatios(apiConfig.protocol, selectedModel)[0] || baseParams.aspectRatio;
     const resolution = normalizeResolutionForRequest(
       spec.resolution ? safeImageResolution(spec.resolution) : safeImageResolution(baseParams.resolution),
       apiConfig.protocol,
       selectedModel,
     );
+    const aspectRatio = isAspectRatioSupported(apiConfig.protocol, recommendedRatio, selectedModel, resolution)
+      ? recommendedRatio
+      : getSupportedAspectRatios(apiConfig.protocol, selectedModel, resolution)[0] || baseParams.aspectRatio;
     return {
       ...baseParams,
       aspectRatio,
@@ -5772,18 +5956,23 @@ export default function App() {
   function updateParams(patch: Partial<ImageParams>) {
     cancelAnalysisCountdown();
     setParams((current) => {
-      const nextAspectRatio = patch.aspectRatio || current.aspectRatio;
       const nextResolution = normalizeResolutionForRequest(
         patch.resolution ? safeImageResolution(patch.resolution) : safeImageResolution(current.resolution),
         apiConfig.protocol,
         selectedModel,
       );
+      const candidateAspectRatio = patch.aspectRatio || current.aspectRatio;
+      const nextSupportedRatios = getSupportedAspectRatios(apiConfig.protocol, selectedModel, nextResolution);
+      const nextAspectRatio = nextSupportedRatios.includes(candidateAspectRatio)
+        ? candidateAspectRatio
+        : nextSupportedRatios[0] || "1:1";
+      const candidateSize = typeof patch.size === "string" ? patch.size : current.size;
       return {
         ...current,
         ...patch,
         aspectRatio: nextAspectRatio,
         resolution: nextResolution,
-        size: resolveRequestSize(nextAspectRatio, nextResolution, apiConfig.protocol, selectedModel),
+        size: resolveRequestSize(nextAspectRatio, nextResolution, apiConfig.protocol, selectedModel, candidateSize),
         batchCount: patch.batchCount !== undefined
           ? clampNumber(Number(patch.batchCount), 1, 20)
           : current.batchCount,
@@ -5850,17 +6039,17 @@ export default function App() {
     setSelectedModel(nextModel);
     setModelFilter("");
     setParams((current) => {
-      const nextSupportedRatios = getSupportedAspectRatios(nextProtocol, nextModel);
+      const canScale = isGptImage2ProModel(nextModel) || !usesOfficialGptImageSizing(nextProtocol, nextModel);
+      const nextResolution = canScale ? current.resolution : "1K" as ImageResolution;
+      const nextSupportedRatios = getSupportedAspectRatios(nextProtocol, nextModel, nextResolution);
       const nextAspectRatio = nextSupportedRatios.includes(current.aspectRatio)
         ? current.aspectRatio
         : nextSupportedRatios[0] || "1:1";
-      const canScale = isGptImage2ProModel(nextModel) || !usesOfficialGptImageSizing(nextProtocol, nextModel);
-      const nextResolution = canScale ? current.resolution : "1K" as ImageResolution;
       return {
         ...current,
         aspectRatio: nextAspectRatio,
         resolution: nextResolution,
-        size: resolveRequestSize(nextAspectRatio, nextResolution, nextProtocol, nextModel),
+        size: resolveRequestSize(nextAspectRatio, nextResolution, nextProtocol, nextModel, current.size),
       };
     });
   }
@@ -6071,17 +6260,23 @@ export default function App() {
     const recommendedRatio = typeof plan.recommendedParams.aspectRatio === "string"
       ? plan.recommendedParams.aspectRatio
       : params.aspectRatio;
-    const nextRatio = isAspectRatioSupported(apiConfig.protocol, recommendedRatio, selectedModel)
+    const nextResolution = normalizeResolutionForRequest(
+      safeImageResolution(params.resolution),
+      apiConfig.protocol,
+      selectedModel,
+    );
+    const nextRatio = isAspectRatioSupported(apiConfig.protocol, recommendedRatio, selectedModel, nextResolution)
       ? recommendedRatio
-      : params.aspectRatio;
+      : getSupportedAspectRatios(apiConfig.protocol, selectedModel, nextResolution)[0] || params.aspectRatio;
     return {
       ...params,
       aspectRatio: nextRatio,
       size: resolveRequestSize(
         nextRatio,
-        normalizeResolutionForRequest(safeImageResolution(params.resolution), apiConfig.protocol, selectedModel),
+        nextResolution,
         apiConfig.protocol,
         selectedModel,
+        params.size,
       ),
       negativePrompt: plan.negativePrompt || params.negativePrompt,
     } as ImageParams;
@@ -6179,6 +6374,13 @@ export default function App() {
     }
   }
 
+  function enterCanvas() {
+    setActivePage("canvas");
+    if (window.location.hash !== "#canvas") {
+      window.history.pushState(null, "", "#canvas");
+    }
+  }
+
   function returnHome() {
     setActivePage("home");
     if (window.location.hash) {
@@ -6207,7 +6409,7 @@ export default function App() {
   const suggestedRatio = analysisResult?.suggestedParams.aspectRatio;
   const suggestedSize = analysisResult?.suggestedParams.size || (
     suggestedRatio
-      ? resolveRequestSize(suggestedRatio, selectedResolution, apiConfig.protocol, selectedModel)
+      ? resolveRequestSize(suggestedRatio, selectedResolution, apiConfig.protocol, selectedModel, params.size)
       : ""
   );
   const suggestedCount = analysisResult?.suggestedParams.count;
@@ -6226,7 +6428,7 @@ export default function App() {
     return (
       <>
         {frontendUpdateNotice}
-        <HomePage onEnter={enterStudio} onSquare={enterSquare} onAdmin={enterAdmin} oauthUser={oauthUser} onOauthLogout={oauthLogout} />
+        <HomePage onEnter={enterStudio} onSquare={enterSquare} onAdmin={enterAdmin} onCanvas={enterCanvas} oauthUser={oauthUser} onOauthLogout={oauthLogout} />
       </>
     );
   }
@@ -6239,6 +6441,24 @@ export default function App() {
           apiKey={apiConfig.apiKey}
           onBackHome={returnHome}
           onEnterStudio={enterStudio}
+          onCanvas={enterCanvas}
+        />
+      </>
+    );
+  }
+
+  if (activePage === "canvas") {
+    return (
+      <>
+        {frontendUpdateNotice}
+        <CanvasPage
+          apiConfig={apiConfig}
+          selectedModel={selectedModel}
+          selectableModels={selectableImageModels}
+          modelState={modelState}
+          onBackHome={returnHome}
+          onEnterStudio={enterStudio}
+          onEnterSquare={enterSquare}
         />
       </>
     );
@@ -7444,8 +7664,38 @@ export default function App() {
           <div className="ratio-preview">
             <strong>{selectedResolution}</strong>
             <span>{selectedResolutionDefinition.hint}</span>
-            <small>{isOfficialGptImageSizeMode ? "GPT Image 2 仅使用官方固定尺寸，选择 Pro 模型可用 2K/4K" : isGemini3ProImageModel(selectedModel) ? "Gemini 3 Pro 会以 imageSize 传递 1K/2K/4K" : isGptImage2ProModel(selectedModel) ? "Pro 模型支持 2K/4K 高分辨率输出" : "尺寸会随宽高比自动换算"}</small>
+            <small>{isOfficialGptImageSizeMode ? "该 image-2 模型使用官方固定尺寸" : isGemini3ProImageModel(selectedModel) ? "Gemini 3 Pro 会以 imageSize 传递 1K/2K/4K" : supportsGptImage2ExplicitSizes(selectedModel) ? "GPT Image 2 支持显式 2K/4K 尺寸" : "尺寸会随宽高比自动换算"}</small>
           </div>
+          {explicitSizeOptions.length > 0 && (
+            <>
+              <label>
+                <span>尺寸</span>
+                <select
+                  value={resolvedRequestSize}
+                  onChange={(event) => {
+                    const option = gptImage2SizeOptionForSize(event.target.value);
+                    if (!option) return;
+                    updateParams({
+                      aspectRatio: option.aspectRatio,
+                      resolution: option.resolution,
+                      size: option.size,
+                    });
+                  }}
+                >
+                  {explicitSizeOptions.map((option) => (
+                    <option key={option.size} value={option.size}>
+                      {option.size} · {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="ratio-preview">
+                <strong>{resolvedRequestSize}</strong>
+                <span>{selectedExplicitSizeOption?.label || "GPT Image 2 显式尺寸"}</span>
+                <small>{selectedResolution} · {params.aspectRatio}</small>
+              </div>
+            </>
+          )}
           <label>
             <span>质量</span>
             <select
@@ -8202,8 +8452,1380 @@ function AdminJsonBlock({ title, value }: { title: string; value: unknown }) {
   );
 }
 
-function HomePage({ onEnter, onSquare, onAdmin, oauthUser, onOauthLogout }: {
-  onEnter: () => void; onSquare: () => void; onAdmin: () => void;
+// ══════════════════════════════════════
+// Canvas Page Component
+// ══════════════════════════════════════
+
+function CanvasPage({
+  apiConfig,
+  selectedModel: globalSelectedModel,
+  selectableModels,
+  modelState,
+  onBackHome,
+  onEnterStudio,
+  onEnterSquare,
+}: {
+  apiConfig: ApiConfig;
+  selectedModel: string;
+  selectableModels: string[];
+  modelState: ModelLoadState;
+  onBackHome: () => void;
+  onEnterStudio: () => void;
+  onEnterSquare: () => void;
+}) {
+  // ── State ──
+  const [canvasNodes, setCanvasNodes] = useState<CanvasNode[]>([]);
+  const [canvasEdges, setCanvasEdges] = useState<CanvasEdge[]>([]);
+  const [viewport, setViewport] = useState<CanvasViewport>({ x: 0, y: 0, zoom: 1 });
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [panelMode, setPanelMode] = useState<CanvasPanelMode>("generate");
+  const [isPanelOpen, setIsPanelOpen] = useState(true);
+  const [canvasPrompt, setCanvasPrompt] = useState("");
+  const [canvasModel, setCanvasModel] = useState(() => globalSelectedModel || selectableModels[0] || "");
+  const [canvasAspectRatio, setCanvasAspectRatio] = useState("1:1");
+  const [canvasResolution, setCanvasResolution] = useState<ImageResolution>("1K");
+  const [canvasSize, setCanvasSize] = useState("");
+  const [canvasQuality, setCanvasQuality] = useState("auto");
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [optimizeSourceNode, setOptimizeSourceNode] = useState<CanvasNode | null>(null);
+  const [optimizePrompt, setOptimizePrompt] = useState("");
+  const [compressedRef, setCompressedRef] = useState<{ dataUrl: string; size: number } | null>(null);
+  const [isSpaceHeld, setIsSpaceHeld] = useState(false);
+  const [toastMessage, setToastMessage] = useState("");
+  const [canvasLoaded, setCanvasLoaded] = useState(false);
+  const [isMinimapVisible, setIsMinimapVisible] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
+
+  // ── Refs ──
+  const containerRef = useRef<HTMLDivElement>(null);
+  const promptInputRef = useRef<HTMLTextAreaElement>(null);
+  const optimizePromptRef = useRef<HTMLTextAreaElement>(null);
+  const nodesRef = useRef(canvasNodes);
+  nodesRef.current = canvasNodes;
+  const edgesRef = useRef(canvasEdges);
+  edgesRef.current = canvasEdges;
+  const viewportRef = useRef(viewport);
+  viewportRef.current = viewport;
+  const isPanningRef = useRef(false);
+  const isDraggingNodeRef = useRef(false);
+  const panStartRef = useRef({ screenX: 0, screenY: 0, vpX: 0, vpY: 0 });
+  const dragStartRef = useRef({ nodeId: "", startX: 0, startY: 0, screenX: 0, screenY: 0 });
+  const saveTimerRef = useRef<number>(0);
+  const toastTimerRef = useRef<number>(0);
+
+  // ── Helper: aspect ratio to number ──
+  function aspectRatioToNumber(ratio: string): number {
+    const parts = ratio.split(":").map(Number);
+    if (parts.length === 2 && parts[0] > 0 && parts[1] > 0) return parts[0] / parts[1];
+    return 1;
+  }
+
+  // ── Helper: show toast ──
+  function showToast(message: string) {
+    setToastMessage(message);
+    window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => setToastMessage(""), 2000);
+  }
+
+  // ── Helper: debounced save ──
+  function scheduleSave() {
+    window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(() => {
+      const state: CanvasPersistedState = {
+        nodes: nodesRef.current.map(({ objectUrl: _objectUrl, ...rest }) => rest),
+        edges: edgesRef.current,
+        viewport: viewportRef.current,
+        lastSavedAt: Date.now(),
+      };
+      void saveCanvasStateToDB(state);
+    }, CANVAS_SAVE_DEBOUNCE_MS);
+  }
+
+  // ── Load canvas state from IndexedDB on mount ──
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const saved = await loadCanvasStateFromDB();
+        if (cancelled || !saved) { setCanvasLoaded(true); return; }
+        const loadedNodes: CanvasNode[] = [];
+        for (const node of saved.nodes) {
+          if (node.status === "success") {
+            const blob = await loadCanvasImageFromDB(node.id);
+            if (blob) {
+              loadedNodes.push({ ...node, objectUrl: URL.createObjectURL(blob) });
+            } else {
+              loadedNodes.push({ ...node, status: "error", error: "图片数据丢失" });
+            }
+          } else if (node.status === "generating") {
+            // Was generating when page closed - mark as error
+            loadedNodes.push({ ...node, status: "error", error: "生成中断（页面关闭）" });
+          } else {
+            loadedNodes.push(node);
+          }
+        }
+        if (!cancelled) {
+          setCanvasNodes(loadedNodes);
+          setCanvasEdges(saved.edges || []);
+          setViewport(saved.viewport || { x: 0, y: 0, zoom: 1 });
+          setCanvasLoaded(true);
+        }
+      } catch {
+        if (!cancelled) setCanvasLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // ── Cleanup objectUrls on unmount ──
+  useEffect(() => {
+    return () => {
+      nodesRef.current.forEach((n) => { if (n.objectUrl) URL.revokeObjectURL(n.objectUrl); });
+    };
+  }, []);
+
+  // ── Save on beforeunload ──
+  useEffect(() => {
+    const handler = () => {
+      const state: CanvasPersistedState = {
+        nodes: nodesRef.current.map(({ objectUrl: _objectUrl, ...rest }) => rest),
+        edges: edgesRef.current,
+        viewport: viewportRef.current,
+        lastSavedAt: Date.now(),
+      };
+      void saveCanvasStateToDB(state);
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, []);
+
+  // ── Auto-save when nodes/edges change ──
+  useEffect(() => {
+    if (canvasLoaded) scheduleSave();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasNodes, canvasEdges, canvasLoaded]);
+
+  // ── Zoom helpers ──
+  function clampZoomVal(z: number) { return clampNumber(z, 0.1, 3); }
+
+  function zoomAtPoint(screenX: number, screenY: number, newZoom: number) {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const vp = viewportRef.current;
+    const canvasX = (screenX - rect.left) / vp.zoom + vp.x;
+    const canvasY = (screenY - rect.top) / vp.zoom + vp.y;
+    setViewport({
+      x: canvasX - (screenX - rect.left) / newZoom,
+      y: canvasY - (screenY - rect.top) / newZoom,
+      zoom: newZoom,
+    });
+  }
+
+  function zoomAtCenter(newZoom: number) {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    zoomAtPoint(rect.left + rect.width / 2, rect.top + rect.height / 2, newZoom);
+  }
+
+  function fitAllNodes() {
+    if (canvasNodes.length === 0) return;
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const pad = 80;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of canvasNodes) {
+      if (n.x < minX) minX = n.x;
+      if (n.y < minY) minY = n.y;
+      if (n.x + n.width > maxX) maxX = n.x + n.width;
+      if (n.y + n.height > maxY) maxY = n.y + n.height;
+    }
+    const cw = maxX - minX + pad * 2;
+    const ch = maxY - minY + pad * 2;
+    const zoom = clampZoomVal(Math.min(rect.width / cw, rect.height / ch));
+    setViewport({
+      x: minX - pad + (cw - rect.width / zoom) / 2,
+      y: minY - pad + (ch - rect.height / zoom) / 2,
+      zoom,
+    });
+  }
+
+  // ── Viewport center in canvas coords ──
+  function viewportCenter() {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+    const vp = viewportRef.current;
+    return {
+      x: vp.x + rect.width / (2 * vp.zoom),
+      y: vp.y + rect.height / (2 * vp.zoom),
+    };
+  }
+
+  // ── Find non-overlapping position ──
+  function findNonOverlappingPos(cx: number, cy: number, w: number, h: number) {
+    let x = cx - w / 2;
+    const y = cy - h / 2;
+    const overlaps = (nx: number, ny: number) =>
+      nodesRef.current.some((n) =>
+        nx < n.x + n.width + 20 && nx + w + 20 > n.x && ny < n.y + n.height + 20 && ny + h + 20 > n.y
+      );
+    let attempts = 0;
+    while (overlaps(x, y) && attempts < 20) {
+      x += w + 40;
+      attempts++;
+    }
+    return { x, y };
+  }
+
+  // ── Pan & Zoom event handlers ──
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    function onWheel(e: WheelEvent) {
+      e.preventDefault();
+      const vp = viewportRef.current;
+      if (e.ctrlKey || e.metaKey) {
+        // Zoom
+        const factor = e.deltaY > 0 ? 1 / 1.08 : 1.08;
+        const nz = clampZoomVal(vp.zoom * factor);
+        const rect = el!.getBoundingClientRect();
+        const cx = (e.clientX - rect.left) / vp.zoom + vp.x;
+        const cy = (e.clientY - rect.top) / vp.zoom + vp.y;
+        setViewport({
+          x: cx - (e.clientX - rect.left) / nz,
+          y: cy - (e.clientY - rect.top) / nz,
+          zoom: nz,
+        });
+      } else {
+        // Pan
+        setViewport({
+          x: vp.x + e.deltaX / vp.zoom,
+          y: vp.y + e.deltaY / vp.zoom,
+          zoom: vp.zoom,
+        });
+      }
+    }
+
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  // ── Pointer events for panning and node dragging ──
+  function handleCanvasPointerDown(e: React.PointerEvent) {
+    if (e.target !== e.currentTarget && !isSpaceHeld) return; // clicked on a child, not canvas background
+    // Deselect if clicking on canvas background
+    if (e.button === 0 && !isSpaceHeld) {
+      setSelectedNodeId(null);
+      if (panelMode === "optimize") {
+        setPanelMode("generate");
+        setOptimizeSourceNode(null);
+        setCompressedRef(null);
+      }
+    }
+    // Start pan
+    if (e.button === 1 || e.button === 2 || (e.button === 0 && isSpaceHeld)) {
+      e.preventDefault();
+      isPanningRef.current = true;
+      panStartRef.current = {
+        screenX: e.clientX,
+        screenY: e.clientY,
+        vpX: viewportRef.current.x,
+        vpY: viewportRef.current.y,
+      };
+      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    }
+  }
+
+  function handleCanvasPointerMove(e: React.PointerEvent) {
+    if (isDraggingNodeRef.current) {
+      const ds = dragStartRef.current;
+      const vp = viewportRef.current;
+      const dx = (e.clientX - ds.screenX) / vp.zoom;
+      const dy = (e.clientY - ds.screenY) / vp.zoom;
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === ds.nodeId ? { ...n, x: ds.startX + dx, y: ds.startY + dy } : n
+      ));
+      return;
+    }
+    if (isPanningRef.current) {
+      const ps = panStartRef.current;
+      const vp = viewportRef.current;
+      setViewport({
+        x: ps.vpX - (e.clientX - ps.screenX) / vp.zoom,
+        y: ps.vpY - (e.clientY - ps.screenY) / vp.zoom,
+        zoom: vp.zoom,
+      });
+    }
+  }
+
+  function handleCanvasPointerUp() {
+    if (isDraggingNodeRef.current) {
+      isDraggingNodeRef.current = false;
+      scheduleSave();
+    }
+    if (isPanningRef.current) {
+      isPanningRef.current = false;
+    }
+  }
+
+  function handleNodePointerDown(e: React.PointerEvent, node: CanvasNode) {
+    if (isSpaceHeld || e.button !== 0) return;
+    e.stopPropagation();
+    setSelectedNodeId(node.id);
+    isDraggingNodeRef.current = true;
+    dragStartRef.current = {
+      nodeId: node.id,
+      startX: node.x,
+      startY: node.y,
+      screenX: e.clientX,
+      screenY: e.clientY,
+    };
+  }
+
+  // ── Keyboard shortcuts ──
+  useEffect(() => {
+    function isInputFocused() {
+      const tag = document.activeElement?.tagName;
+      return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === " " && !isInputFocused()) {
+        e.preventDefault();
+        setIsSpaceHeld(true);
+      }
+      if (e.key === "Escape") {
+        setSelectedNodeId(null);
+        if (panelMode === "optimize") {
+          setPanelMode("generate");
+          setOptimizeSourceNode(null);
+          setCompressedRef(null);
+        }
+        setShowDeleteConfirm(null);
+      }
+      if ((e.key === "Delete" || e.key === "Backspace") && !isInputFocused() && selectedNodeId) {
+        e.preventDefault();
+        setShowDeleteConfirm(selectedNodeId);
+      }
+      if (e.key === "e" && !isInputFocused() && selectedNodeId) {
+        const node = nodesRef.current.find((n) => n.id === selectedNodeId);
+        if (node?.status === "success") void enterOptimizeMode(node);
+      }
+      if (e.key === "m" && !isInputFocused()) {
+        setIsMinimapVisible((v) => !v);
+      }
+      if ((e.metaKey || e.ctrlKey) && (e.key === "=" || e.key === "+")) {
+        e.preventDefault();
+        const nz = clampZoomVal(viewportRef.current.zoom * 1.2);
+        zoomAtCenter(nz);
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === "-") {
+        e.preventDefault();
+        const nz = clampZoomVal(viewportRef.current.zoom / 1.2);
+        zoomAtCenter(nz);
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === "0") {
+        e.preventDefault();
+        zoomAtCenter(1);
+      }
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "f" || e.key === "F")) {
+        e.preventDefault();
+        fitAllNodes();
+      }
+    }
+    function onKeyUp(e: KeyboardEvent) {
+      if (e.key === " ") setIsSpaceHeld(false);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedNodeId, panelMode]);
+
+  // ── Context menu prevention ──
+  function handleContextMenu(e: React.MouseEvent) {
+    e.preventDefault();
+  }
+
+  // ── Delete node ──
+  function confirmDeleteNode(id: string) {
+    const node = canvasNodes.find((n) => n.id === id);
+    if (node?.objectUrl) URL.revokeObjectURL(node.objectUrl);
+    setCanvasNodes((prev) => prev.filter((n) => n.id !== id));
+    setCanvasEdges((prev) => prev.filter((edge) => edge.fromNodeId !== id && edge.toNodeId !== id));
+    if (selectedNodeId === id) {
+      setSelectedNodeId(null);
+      if (panelMode === "optimize") {
+        setPanelMode("generate");
+        setOptimizeSourceNode(null);
+        setCompressedRef(null);
+      }
+    }
+    setShowDeleteConfirm(null);
+    void deleteCanvasImageFromDB(id);
+  }
+
+  // ── Download node ──
+  function downloadNode(node: CanvasNode) {
+    if (!node.objectUrl) return;
+    const a = document.createElement("a");
+    a.href = node.objectUrl;
+    a.download = `${node.model}-${node.params.aspectRatio.replace(":", "x")}-${Date.now()}.png`;
+    a.click();
+  }
+
+  // ── Copy prompt ──
+  function copyPrompt(node: CanvasNode) {
+    void navigator.clipboard.writeText(node.prompt);
+    showToast("提示词已复制");
+  }
+
+  // ── Enter optimize mode ──
+  async function enterOptimizeMode(node: CanvasNode) {
+    setPanelMode("optimize");
+    setOptimizeSourceNode(node);
+    setOptimizePrompt("");
+    setIsPanelOpen(true);
+    setCompressedRef(null);
+    // Compress the image
+    try {
+      const blob = await loadCanvasImageFromDB(node.id);
+      if (!blob) return;
+      const dataUrl = await blobToDataUrl(blob);
+      // Use createSquareThumbnail with maxEdge 1024
+      const result = await createSquareThumbnail(dataUrl, 1024);
+      const size = Math.round(result.dataUrl.length * 3 / 4); // approximate byte size
+      setCompressedRef({ dataUrl: result.dataUrl, size });
+    } catch {
+      // Failed to compress, use original objectUrl
+    }
+  }
+
+  // ── Generation flow ──
+  async function handleCanvasGenerate() {
+    const trimmedPrompt = canvasPrompt.trim();
+    if (!trimmedPrompt || !canvasModel || modelState.status !== "ready") return;
+
+    const aspectNum = aspectRatioToNumber(canvasAspectRatio);
+    const nodeW = CANVAS_DEFAULT_NODE_WIDTH;
+    const nodeH = Math.round(nodeW / aspectNum);
+    const center = viewportCenter();
+    const pos = findNonOverlappingPos(center.x, center.y, nodeW, nodeH);
+
+    const nodeId = uid();
+    const size = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel, canvasSize);
+    const newNode: CanvasNode = {
+      id: nodeId,
+      type: "image",
+      x: pos.x,
+      y: pos.y,
+      width: nodeW,
+      height: nodeH,
+      prompt: trimmedPrompt,
+      model: canvasModel,
+      protocol: apiConfig.protocol,
+      params: {
+        aspectRatio: canvasAspectRatio,
+        size,
+        resolution: canvasResolution,
+        quality: canvasQuality,
+        outputFormat: "png",
+        batchCount: 1,
+        concurrency: 1,
+        retryLimit: 0,
+        seed: "",
+        negativePrompt: "",
+      },
+      status: "generating",
+      createdAt: Date.now(),
+    };
+
+    setCanvasNodes((prev) => [...prev, newNode]);
+    setCanvasPrompt("");
+    setIsGenerating(true);
+
+    const startedAt = Date.now();
+    try {
+      const response = await fetch("/api/images/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
+          apiKey: apiConfig.apiKey,
+          clientId: getClientId(),
+          request: {
+            protocol: apiConfig.protocol,
+            model: canvasModel,
+            prompt: trimmedPrompt,
+            referenceImages: [],
+            aspectRatio: canvasAspectRatio,
+            size,
+            resolution: canvasResolution,
+            quality: canvasQuality,
+            outputFormat: "png",
+            seed: "",
+          },
+        }),
+      });
+      const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
+      if (!response.ok || !payload.ok || !payload.images?.[0]?.dataUrl) {
+        const detail = payload.detail && typeof payload.detail === "object"
+          ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
+          : payload.detail || "生成失败";
+        throw new Error(String(detail));
+      }
+      const dataUrl = payload.images[0].dataUrl;
+      const blob = await dataUrlToBlob(dataUrl);
+      const objectUrl = URL.createObjectURL(blob);
+      const { width, height } = await getImageSize(objectUrl);
+      const duration = Date.now() - startedAt;
+      const adjustedH = Math.round(nodeW * (height / width));
+
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === nodeId ? {
+          ...n,
+          status: "success" as const,
+          objectUrl,
+          width: nodeW,
+          height: adjustedH,
+          imageWidth: width,
+          imageHeight: height,
+          duration,
+        } : n
+      ));
+      await saveCanvasImageToDB(nodeId, blob);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === nodeId ? { ...n, status: "error" as const, error: message } : n
+      ));
+    } finally {
+      setIsGenerating(false);
+    }
+  }
+
+  // ── Optimize generation flow ──
+  async function handleCanvasOptimize() {
+    if (!optimizeSourceNode || !compressedRef) return;
+    const sourceNode = optimizeSourceNode;
+    const supplement = optimizePrompt.trim();
+    const finalPrompt = supplement
+      ? `基于参考图进行优化。原始描述：${sourceNode.prompt}。优化方向：${supplement}`
+      : sourceNode.prompt;
+
+    const aspectNum = aspectRatioToNumber(canvasAspectRatio);
+    const nodeW = CANVAS_DEFAULT_NODE_WIDTH;
+    const nodeH = Math.round(nodeW / aspectNum);
+
+    // Position to the right of parent
+    let newX = sourceNode.x + sourceNode.width + 60;
+    let newY = sourceNode.y;
+    // If overlapping, shift down
+    let attempts = 0;
+    while (
+      nodesRef.current.some((n) =>
+        newX < n.x + n.width + 20 && newX + nodeW + 20 > n.x &&
+        newY < n.y + n.height + 20 && newY + nodeH + 20 > n.y
+      ) && attempts < 20
+    ) {
+      newY += nodeH + 40;
+      attempts++;
+    }
+
+    const nodeId = uid();
+    const edgeId = uid();
+    const size = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel, canvasSize);
+    const newNode: CanvasNode = {
+      id: nodeId,
+      type: "image",
+      x: newX,
+      y: newY,
+      width: nodeW,
+      height: nodeH,
+      prompt: finalPrompt,
+      model: canvasModel,
+      protocol: apiConfig.protocol,
+      params: {
+        aspectRatio: canvasAspectRatio,
+        size,
+        resolution: canvasResolution,
+        quality: canvasQuality,
+        outputFormat: "png",
+        batchCount: 1,
+        concurrency: 1,
+        retryLimit: 0,
+        seed: "",
+        negativePrompt: "",
+      },
+      status: "generating",
+      parentId: sourceNode.id,
+      referenceNodeId: sourceNode.id,
+      createdAt: Date.now(),
+    };
+    const newEdge: CanvasEdge = { id: edgeId, fromNodeId: sourceNode.id, toNodeId: nodeId };
+
+    setCanvasNodes((prev) => [...prev, newNode]);
+    setCanvasEdges((prev) => [...prev, newEdge]);
+    setIsGenerating(true);
+
+    const startedAt = Date.now();
+    try {
+      const response = await fetch("/api/images/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
+          apiKey: apiConfig.apiKey,
+          clientId: getClientId(),
+          request: {
+            protocol: apiConfig.protocol,
+            model: canvasModel,
+            prompt: finalPrompt,
+            referenceImages: [{
+              name: "reference.webp",
+              type: "image/webp",
+              dataUrl: compressedRef.dataUrl,
+              originalBytes: compressedRef.size,
+              requestBytes: compressedRef.size,
+              compressed: true,
+            }],
+            aspectRatio: canvasAspectRatio,
+            size,
+            resolution: canvasResolution,
+            quality: canvasQuality,
+            outputFormat: "png",
+            seed: "",
+          },
+        }),
+      });
+      const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
+      if (!response.ok || !payload.ok || !payload.images?.[0]?.dataUrl) {
+        const detail = payload.detail && typeof payload.detail === "object"
+          ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
+          : payload.detail || "生成失败";
+        throw new Error(String(detail));
+      }
+      const dataUrl = payload.images[0].dataUrl;
+      const blob = await dataUrlToBlob(dataUrl);
+      const objectUrl = URL.createObjectURL(blob);
+      const { width, height } = await getImageSize(objectUrl);
+      const duration = Date.now() - startedAt;
+      const adjustedH = Math.round(nodeW * (height / width));
+
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === nodeId ? {
+          ...n,
+          status: "success" as const,
+          objectUrl,
+          width: nodeW,
+          height: adjustedH,
+          imageWidth: width,
+          imageHeight: height,
+          duration,
+        } : n
+      ));
+      await saveCanvasImageToDB(nodeId, blob);
+      // Auto-select new node for chaining
+      setSelectedNodeId(nodeId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === nodeId ? { ...n, status: "error" as const, error: message } : n
+      ));
+    } finally {
+      setIsGenerating(false);
+    }
+  }
+
+  // ── Retry failed node ──
+  async function retryNode(node: CanvasNode) {
+    setCanvasNodes((prev) => prev.map((n) =>
+      n.id === node.id ? { ...n, status: "generating" as const, error: undefined } : n
+    ));
+    setIsGenerating(true);
+    const startedAt = Date.now();
+    try {
+      const referenceImages: SubmittedReference[] = [];
+      if (node.referenceNodeId && node.parentId) {
+        // Try to get parent's compressed reference
+        const parentBlob = await loadCanvasImageFromDB(node.parentId);
+        if (parentBlob) {
+          const parentDataUrl = await blobToDataUrl(parentBlob);
+          const compressed = await createSquareThumbnail(parentDataUrl, 1024);
+          referenceImages.push({
+            name: "reference.webp",
+            type: "image/webp",
+            dataUrl: compressed.dataUrl,
+            originalBytes: compressed.dataUrl.length,
+            requestBytes: compressed.dataUrl.length,
+            compressed: true,
+          });
+        }
+      }
+      const response = await fetch("/api/images/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
+          apiKey: apiConfig.apiKey,
+          clientId: getClientId(),
+          request: {
+            protocol: node.protocol,
+            model: node.model,
+            prompt: node.prompt,
+            referenceImages,
+            aspectRatio: node.params.aspectRatio,
+            size: node.params.size,
+            resolution: node.params.resolution,
+            quality: node.params.quality,
+            outputFormat: node.params.outputFormat,
+            seed: "",
+          },
+        }),
+      });
+      const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
+      if (!response.ok || !payload.ok || !payload.images?.[0]?.dataUrl) {
+        const detail = payload.detail && typeof payload.detail === "object"
+          ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
+          : payload.detail || "生成失败";
+        throw new Error(String(detail));
+      }
+      const dataUrl = payload.images[0].dataUrl;
+      const blob = await dataUrlToBlob(dataUrl);
+      const objectUrl = URL.createObjectURL(blob);
+      const { width, height } = await getImageSize(objectUrl);
+      const duration = Date.now() - startedAt;
+      const nodeW = CANVAS_DEFAULT_NODE_WIDTH;
+      const adjustedH = Math.round(nodeW * (height / width));
+
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === node.id ? {
+          ...n,
+          status: "success" as const,
+          objectUrl,
+          width: nodeW,
+          height: adjustedH,
+          imageWidth: width,
+          imageHeight: height,
+          duration,
+          error: undefined,
+        } : n
+      ));
+      await saveCanvasImageToDB(node.id, blob);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setCanvasNodes((prev) => prev.map((n) =>
+        n.id === node.id ? { ...n, status: "error" as const, error: message } : n
+      ));
+    } finally {
+      setIsGenerating(false);
+    }
+  }
+
+  // ── Computed values ──
+  const selectedNode = canvasNodes.find((n) => n.id === selectedNodeId) || null;
+  const canScale = isGptImage2ProModel(canvasModel) || !usesOfficialGptImageSizing(apiConfig.protocol, canvasModel);
+  const canvasEffectiveResolution = canScale ? canvasResolution : DEFAULT_IMAGE_RESOLUTION;
+  const supportedAspectRatios = getSupportedAspectRatios(apiConfig.protocol, canvasModel, canvasEffectiveResolution);
+  const resolvedSize = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel, canvasSize);
+  const canvasExplicitSizeOptions = explicitSizeOptionsForModel(canvasModel, canvasEffectiveResolution);
+  const selectedCanvasSizeOption = canvasExplicitSizeOptions.find((option) => option.size === resolvedSize);
+  const isApiReady = modelState.status === "ready" && apiConfig.apiKey.trim().length >= 8;
+
+  // ── Update model when global changes ──
+  useEffect(() => {
+    if (globalSelectedModel && selectableModels.includes(globalSelectedModel)) {
+      setCanvasModel(globalSelectedModel);
+    }
+  }, [globalSelectedModel, selectableModels]);
+
+  // ── Update aspect ratio when model changes ──
+  useEffect(() => {
+    const nextResolution = canScale ? canvasResolution : DEFAULT_IMAGE_RESOLUTION;
+    const ratios = getSupportedAspectRatios(apiConfig.protocol, canvasModel, nextResolution);
+    if (!ratios.includes(canvasAspectRatio)) {
+      setCanvasAspectRatio(ratios[0] || "1:1");
+    }
+    if (!canScale && canvasResolution !== DEFAULT_IMAGE_RESOLUTION) {
+      setCanvasResolution("1K");
+    }
+    const nextSize = resolveRequestSize(canvasAspectRatio, nextResolution, apiConfig.protocol, canvasModel, canvasSize);
+    if (nextSize !== canvasSize) {
+      setCanvasSize(nextSize);
+    }
+  }, [apiConfig.protocol, canScale, canvasAspectRatio, canvasModel, canvasResolution, canvasSize]);
+
+  // ── Floating toolbar position ──
+  const toolbarPos = useMemo(() => {
+    if (!selectedNode || !containerRef.current) return null;
+    const rect = containerRef.current.getBoundingClientRect();
+    const screenX = (selectedNode.x - viewport.x) * viewport.zoom + rect.left + (selectedNode.width * viewport.zoom) / 2;
+    const screenY = (selectedNode.y - viewport.y) * viewport.zoom + rect.top;
+    const aboveY = screenY - 12;
+    const belowY = screenY + selectedNode.height * viewport.zoom + 12;
+    const y = aboveY > rect.top + 56 ? aboveY : belowY;
+    return {
+      x: clampNumber(screenX, rect.left + 100, rect.right - 100),
+      y: clampNumber(y, rect.top + 10, rect.bottom - 50),
+    };
+  }, [selectedNode, viewport]);
+
+  // ── Grid background style ──
+  const gridStyle = useMemo((): CSSProperties => {
+    if (viewport.zoom < 0.25) return {};
+    const spacing = viewport.zoom < 0.5 ? 40 : 20;
+    const rendered = spacing * viewport.zoom;
+    const ox = (-viewport.x * viewport.zoom) % rendered;
+    const oy = (-viewport.y * viewport.zoom) % rendered;
+    return {
+      backgroundImage: `radial-gradient(circle, #e5e5e5 ${Math.max(1, viewport.zoom)}px, transparent ${Math.max(1, viewport.zoom)}px)`,
+      backgroundSize: `${rendered}px ${rendered}px`,
+      backgroundPosition: `${ox}px ${oy}px`,
+    };
+  }, [viewport]);
+
+  // ── Minimap data ──
+  const minimapData = useMemo(() => {
+    if (!isMinimapVisible || canvasNodes.length === 0) return null;
+    const pad = 40;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of canvasNodes) {
+      if (n.x < minX) minX = n.x;
+      if (n.y < minY) minY = n.y;
+      if (n.x + n.width > maxX) maxX = n.x + n.width;
+      if (n.y + n.height > maxY) maxY = n.y + n.height;
+    }
+    const cw = maxX - minX + pad * 2;
+    const ch = maxY - minY + pad * 2;
+    const scale = Math.min(170 / cw, 110 / ch);
+    const rect = containerRef.current?.getBoundingClientRect();
+    const vpW = rect ? rect.width / viewport.zoom : 0;
+    const vpH = rect ? rect.height / viewport.zoom : 0;
+    return { minX: minX - pad, minY: minY - pad, scale, cw, ch, vpW, vpH };
+  }, [isMinimapVisible, canvasNodes, viewport]);
+
+  // ── Render ──
+  return (
+    <main className={`canvas-page ${isPanelOpen ? "" : "panel-collapsed"}`}>
+      <header className="canvas-topbar">
+        <button type="button" className="home-brand canvas-brand" onClick={onBackHome}>
+          <span><img src={imageStudioLogo} alt="" /></span>
+          <strong>Image Studio</strong>
+          <span className="canvas-topbar-badge">Canvas</span>
+        </button>
+        <div className="canvas-topbar-nav">
+          <button type="button" className="subtle-button" onClick={onBackHome}>首页</button>
+          <button type="button" className="subtle-button" onClick={onEnterStudio}>工作台</button>
+          <button type="button" className="subtle-button" onClick={onEnterSquare}>广场</button>
+        </div>
+      </header>
+
+      {/* Canvas viewport */}
+      <div
+        className={`canvas-viewport ${isSpaceHeld ? "is-space-held" : ""} ${isPanningRef.current ? "is-panning" : ""}`}
+        ref={containerRef}
+        onPointerDown={handleCanvasPointerDown}
+        onPointerMove={handleCanvasPointerMove}
+        onPointerUp={handleCanvasPointerUp}
+        onContextMenu={handleContextMenu}
+        style={gridStyle}
+      >
+        {/* Transform layer */}
+        <div
+          className="canvas-transform-layer"
+          style={{
+            transform: `translate(${-viewport.x * viewport.zoom}px, ${-viewport.y * viewport.zoom}px) scale(${viewport.zoom})`,
+          }}
+        >
+          {/* SVG Edges */}
+          <svg className="canvas-edge-layer">
+            <defs>
+              <marker id="canvas-arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+                <path d="M0,0 L6,3 L0,6 Z" fill="rgba(16,185,129,0.4)" />
+              </marker>
+            </defs>
+            {canvasEdges.map((edge) => {
+              const from = canvasNodes.find((n) => n.id === edge.fromNodeId);
+              const to = canvasNodes.find((n) => n.id === edge.toNodeId);
+              if (!from || !to) return null;
+              const x1 = from.x + from.width;
+              const y1 = from.y + from.height / 2;
+              const x2 = to.x;
+              const y2 = to.y + to.height / 2;
+              const dx = Math.abs(x2 - x1) * 0.5;
+              return (
+                <path
+                  key={edge.id}
+                  className="canvas-edge-path"
+                  d={`M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`}
+                  markerEnd="url(#canvas-arrow)"
+                />
+              );
+            })}
+          </svg>
+
+          {/* Nodes */}
+          {canvasNodes.map((node) => (
+            <div
+              key={node.id}
+              className={`canvas-node ${node.status} ${selectedNodeId === node.id ? "selected" : ""} ${isDraggingNodeRef.current && dragStartRef.current.nodeId === node.id ? "dragging" : ""}`}
+              style={{
+                left: node.x,
+                top: node.y,
+                width: node.width,
+                height: node.height,
+              }}
+              onPointerDown={(e) => handleNodePointerDown(e, node)}
+              onDoubleClick={() => {
+                if (node.status === "success") void enterOptimizeMode(node);
+              }}
+            >
+              {node.status === "success" && node.objectUrl && (
+                <img src={node.objectUrl} alt="" draggable={false} className="canvas-node-image" />
+              )}
+              {node.status === "generating" && (
+                <div className="canvas-node-skeleton">
+                  <Loader2 size={24} className="spin" />
+                  <span>生成中...</span>
+                </div>
+              )}
+              {node.status === "error" && (
+                <div className="canvas-node-error-content">
+                  <AlertCircle size={20} />
+                  <span>{node.error || "生成失败"}</span>
+                </div>
+              )}
+              {node.status === "success" && (
+                <>
+                  <span className="canvas-node-badge">{node.model}</span>
+                  {node.duration != null && (
+                    <span className="canvas-node-duration">{formatDuration(node.duration)}</span>
+                  )}
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* Empty state */}
+        {canvasLoaded && canvasNodes.length === 0 && (
+          <div className="canvas-empty-state">
+            <ImagePlus size={48} strokeWidth={1.2} />
+            <strong>无限画布</strong>
+            <p>在无边的空间中自由创作</p>
+            <p className="canvas-empty-hint">在右侧面板输入提示词，图片将生成到画布上。<br />选中图片后可以基于它继续优化。</p>
+            <button type="button" className="canvas-empty-action" onClick={() => { setIsPanelOpen(true); promptInputRef.current?.focus(); }}>
+              开始第一次生成 <ArrowRight size={16} />
+            </button>
+          </div>
+        )}
+
+        {/* Floating toolbar */}
+        {selectedNode && toolbarPos && (
+          <div
+            className="canvas-floating-toolbar"
+            style={{ position: "fixed", left: toolbarPos.x, top: toolbarPos.y, transform: "translate(-50%, -100%)" }}
+          >
+            {selectedNode.status === "success" && (
+              <>
+                <button type="button" onClick={() => void enterOptimizeMode(selectedNode)}>
+                  <WandSparkles size={14} /> 优化
+                </button>
+                <button type="button" onClick={() => downloadNode(selectedNode)}>
+                  <Download size={14} /> 下载
+                </button>
+                <button type="button" onClick={() => copyPrompt(selectedNode)}>
+                  <Copy size={14} /> 复制提示词
+                </button>
+                <button type="button" onClick={() => setShowDeleteConfirm(selectedNode.id)}>
+                  <Trash2 size={14} /> 删除
+                </button>
+              </>
+            )}
+            {selectedNode.status === "error" && (
+              <>
+                <button type="button" onClick={() => void retryNode(selectedNode)}>
+                  <RefreshCw size={14} /> 重试
+                </button>
+                <button type="button" onClick={() => setShowDeleteConfirm(selectedNode.id)}>
+                  <Trash2 size={14} /> 删除
+                </button>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Zoom bar */}
+        <div className="canvas-zoom-bar">
+          <button type="button" onClick={() => { const nz = clampZoomVal(viewport.zoom / 1.2); zoomAtCenter(nz); }}>-</button>
+          <input
+            type="range"
+            min={10}
+            max={300}
+            step={5}
+            value={Math.round(viewport.zoom * 100)}
+            onChange={(e) => zoomAtCenter(Number(e.target.value) / 100)}
+          />
+          <span className="canvas-zoom-label">{Math.round(viewport.zoom * 100)}%</span>
+          <button type="button" onClick={() => { const nz = clampZoomVal(viewport.zoom * 1.2); zoomAtCenter(nz); }}>+</button>
+          <button type="button" onClick={fitAllNodes} title="适应全部节点">
+            <Maximize2 size={15} />
+          </button>
+        </div>
+
+        {/* Minimap */}
+        {isMinimapVisible && minimapData && (
+          <div
+            className="canvas-minimap"
+            onPointerDown={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              const mx = (e.clientX - rect.left) / minimapData.scale + minimapData.minX;
+              const my = (e.clientY - rect.top) / minimapData.scale + minimapData.minY;
+              setViewport((v) => ({
+                ...v,
+                x: mx - minimapData.vpW / 2,
+                y: my - minimapData.vpH / 2,
+              }));
+            }}
+          >
+            {canvasNodes.map((n) => (
+              <div
+                key={n.id}
+                className={`canvas-minimap-node ${n.status} ${n.id === selectedNodeId ? "selected" : ""}`}
+                style={{
+                  left: (n.x - minimapData.minX) * minimapData.scale,
+                  top: (n.y - minimapData.minY) * minimapData.scale,
+                  width: Math.max(4, n.width * minimapData.scale),
+                  height: Math.max(4, n.height * minimapData.scale),
+                }}
+              />
+            ))}
+            <div
+              className="canvas-minimap-viewport"
+              style={{
+                left: (viewport.x - minimapData.minX) * minimapData.scale,
+                top: (viewport.y - minimapData.minY) * minimapData.scale,
+                width: minimapData.vpW * minimapData.scale,
+                height: minimapData.vpH * minimapData.scale,
+              }}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* Right panel */}
+      <aside className={`canvas-right-panel ${isPanelOpen ? "open" : "closed"}`}>
+        {panelMode === "generate" ? (
+          <>
+            <div className="canvas-panel-header">
+              <strong>画布生成</strong>
+              <button type="button" className="icon-button" onClick={() => setIsPanelOpen(false)} title="收起面板">
+                <PanelRightClose size={16} />
+              </button>
+            </div>
+
+            {/* Model selector */}
+            <div className="canvas-panel-section">
+              <label className="canvas-panel-label">模型</label>
+              <select
+                className="canvas-select"
+                value={canvasModel}
+                onChange={(e) => setCanvasModel(e.target.value)}
+              >
+                {selectableModels.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+              <span className="canvas-panel-hint">{imageModelLaneLabel(canvasModel)}</span>
+            </div>
+
+            {/* Prompt */}
+            <div className="canvas-panel-section">
+              <label className="canvas-panel-label">提示词</label>
+              <textarea
+                ref={promptInputRef}
+                className="canvas-prompt-input"
+                value={canvasPrompt}
+                onChange={(e) => setCanvasPrompt(e.target.value)}
+                placeholder="描述你想生成的图片..."
+                rows={4}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void handleCanvasGenerate();
+                  }
+                }}
+              />
+            </div>
+
+            {/* Params */}
+            <details className="canvas-panel-details" open>
+              <summary>参数</summary>
+              <div className="canvas-params-grid">
+                <div className="canvas-param">
+                  <label>宽高比</label>
+                  <select
+                    className="canvas-select"
+                    value={canvasAspectRatio}
+                    onChange={(e) => setCanvasAspectRatio(e.target.value)}
+                  >
+                    {supportedAspectRatios.map((r) => (
+                      <option key={r} value={r}>{r}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="canvas-param">
+                  <label>分辨率</label>
+                  <select
+                    className="canvas-select"
+                    value={canvasResolution}
+                    onChange={(e) => setCanvasResolution(e.target.value as ImageResolution)}
+                    disabled={!canScale}
+                  >
+                    <option value="1K">1K</option>
+                    <option value="2K">2K</option>
+                    <option value="4K">4K</option>
+                  </select>
+                </div>
+                {canvasExplicitSizeOptions.length > 0 && (
+                  <div className="canvas-param">
+                    <label>尺寸</label>
+                    <select
+                      className="canvas-select"
+                      value={resolvedSize}
+                      onChange={(e) => {
+                        const option = gptImage2SizeOptionForSize(e.target.value);
+                        if (!option) return;
+                        setCanvasAspectRatio(option.aspectRatio);
+                        setCanvasResolution(option.resolution);
+                        setCanvasSize(option.size);
+                      }}
+                    >
+                      {canvasExplicitSizeOptions.map((option) => (
+                        <option key={option.size} value={option.size}>
+                          {option.size}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                <div className="canvas-param">
+                  <label>质量</label>
+                  <select
+                    className="canvas-select"
+                    value={canvasQuality}
+                    onChange={(e) => setCanvasQuality(e.target.value)}
+                  >
+                    <option value="auto">auto</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                  </select>
+                </div>
+              </div>
+            </details>
+
+            {/* Size preview */}
+            <div className="canvas-size-preview">
+              {resolvedSize} &middot; {selectedCanvasSizeOption?.label || imageModelLaneLabel(canvasModel)}
+            </div>
+
+            {/* Generate button */}
+            <button
+              type="button"
+              className="canvas-generate-btn"
+              disabled={!canvasPrompt.trim() || !isApiReady || isGenerating}
+              onClick={() => void handleCanvasGenerate()}
+            >
+              {isGenerating ? <><Loader2 size={16} className="spin" /> 生成中...</> : "生成到画布"}
+            </button>
+
+            {!isApiReady && (
+              <div className="canvas-api-hint">
+                请先在工作台配置 API Key 并验证连接
+                <button type="button" className="link-button" onClick={onEnterStudio}>前往配置</button>
+              </div>
+            )}
+
+            {/* Selected node info */}
+            {selectedNode && selectedNode.status === "success" && panelMode === "generate" && (
+              <div className="canvas-panel-section canvas-selected-hint">
+                <span>已选中图片</span>
+                <button type="button" className="canvas-optimize-entry" onClick={() => void enterOptimizeMode(selectedNode)}>
+                  <WandSparkles size={14} /> 基于此图优化
+                </button>
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            {/* Optimize mode */}
+            <div className="canvas-panel-header">
+              <button type="button" className="canvas-back-btn" onClick={() => {
+                setPanelMode("generate");
+                setOptimizeSourceNode(null);
+                setCompressedRef(null);
+              }}>
+                &larr; 返回
+              </button>
+              <strong>优化图片</strong>
+            </div>
+
+            {/* Reference preview */}
+            {compressedRef && (
+              <div className="canvas-ref-preview">
+                <img src={compressedRef.dataUrl} alt="" />
+                <span className="canvas-ref-info">已自动压缩为参考图 &middot; {formatBytes(compressedRef.size)}</span>
+              </div>
+            )}
+            {!compressedRef && optimizeSourceNode && (
+              <div className="canvas-ref-preview loading">
+                <Loader2 size={20} className="spin" />
+                <span>压缩参考图中...</span>
+              </div>
+            )}
+
+            {/* Original prompt */}
+            {optimizeSourceNode && (
+              <div className="canvas-panel-section">
+                <label className="canvas-panel-label">原始提示词</label>
+                <div className="canvas-original-prompt">{optimizeSourceNode.prompt}</div>
+              </div>
+            )}
+
+            {/* Supplementary prompt */}
+            <div className="canvas-panel-section">
+              <label className="canvas-panel-label">补充优化提示词</label>
+              <textarea
+                ref={optimizePromptRef}
+                className="canvas-prompt-input"
+                value={optimizePrompt}
+                onChange={(e) => setOptimizePrompt(e.target.value)}
+                placeholder="描述你想要的修改，如：改为夜景、增加雪花效果..."
+                rows={3}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void handleCanvasOptimize();
+                  }
+                }}
+              />
+            </div>
+
+            {/* Model & params */}
+            <div className="canvas-panel-section">
+              <label className="canvas-panel-label">模型</label>
+              <select
+                className="canvas-select"
+                value={canvasModel}
+                onChange={(e) => setCanvasModel(e.target.value)}
+              >
+                {selectableModels.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="canvas-params-grid">
+              <div className="canvas-param">
+                <label>宽高比</label>
+                <select
+                  className="canvas-select"
+                  value={canvasAspectRatio}
+                  onChange={(e) => setCanvasAspectRatio(e.target.value)}
+                >
+                  {supportedAspectRatios.map((r) => (
+                    <option key={r} value={r}>{r}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="canvas-param">
+                <label>分辨率</label>
+                <select
+                  className="canvas-select"
+                  value={canvasResolution}
+                  onChange={(e) => setCanvasResolution(e.target.value as ImageResolution)}
+                  disabled={!canScale}
+                >
+                  <option value="1K">1K</option>
+                  <option value="2K">2K</option>
+                  <option value="4K">4K</option>
+                </select>
+              </div>
+              {canvasExplicitSizeOptions.length > 0 && (
+                <div className="canvas-param">
+                  <label>尺寸</label>
+                  <select
+                    className="canvas-select"
+                    value={resolvedSize}
+                    onChange={(e) => {
+                      const option = gptImage2SizeOptionForSize(e.target.value);
+                      if (!option) return;
+                      setCanvasAspectRatio(option.aspectRatio);
+                      setCanvasResolution(option.resolution);
+                      setCanvasSize(option.size);
+                    }}
+                  >
+                    {canvasExplicitSizeOptions.map((option) => (
+                      <option key={option.size} value={option.size}>
+                        {option.size}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
+
+            {/* Size preview */}
+            <div className="canvas-size-preview">
+              {resolvedSize} &middot; {selectedCanvasSizeOption?.label || imageModelLaneLabel(canvasModel)}
+            </div>
+
+            {/* Optimize button */}
+            <button
+              type="button"
+              className="canvas-generate-btn"
+              disabled={!compressedRef || !isApiReady || isGenerating}
+              onClick={() => void handleCanvasOptimize()}
+            >
+              {isGenerating ? <><Loader2 size={16} className="spin" /> 优化中...</> : "生成优化"}
+            </button>
+          </>
+        )}
+      </aside>
+
+      {/* Panel expand button when collapsed */}
+      {!isPanelOpen && (
+        <button type="button" className="canvas-panel-expand" onClick={() => setIsPanelOpen(true)}>
+          <PanelRightOpen size={18} />
+        </button>
+      )}
+
+      {/* Toast */}
+      {toastMessage && (
+        <div className="canvas-toast">{toastMessage}</div>
+      )}
+
+      {/* Delete confirmation dialog */}
+      {showDeleteConfirm && (
+        <div className="canvas-dialog-overlay" onClick={() => setShowDeleteConfirm(null)}>
+          <div className="canvas-dialog" onClick={(e) => e.stopPropagation()}>
+            <p>确认删除此图片？此操作不可撤销。</p>
+            <div className="canvas-dialog-actions">
+              <button type="button" className="subtle-button" onClick={() => setShowDeleteConfirm(null)}>取消</button>
+              <button type="button" className="canvas-dialog-danger" onClick={() => confirmDeleteNode(showDeleteConfirm)}>删除</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </main>
+  );
+}
+
+function HomePage({ onEnter, onSquare, onAdmin, onCanvas, oauthUser, onOauthLogout }: {
+  onEnter: () => void; onSquare: () => void; onAdmin: () => void; onCanvas: () => void;
   oauthUser: { sub: string; username: string; displayName: string; email: string; role: number; group: string } | null;
   onOauthLogout: () => void;
 }) {
@@ -8264,6 +9886,9 @@ function HomePage({ onEnter, onSquare, onAdmin, oauthUser, onOauthLogout }: {
             <button type="button" onClick={onSquare}>
               广场
             </button>
+            <button type="button" onClick={onCanvas}>
+              画布
+            </button>
             <button type="button" onClick={() => scrollToSection("home-local")}>
               本地优先
             </button>
@@ -8274,6 +9899,9 @@ function HomePage({ onEnter, onSquare, onAdmin, oauthUser, onOauthLogout }: {
             </button>
             <button type="button" className="home-nav-action" onClick={onSquare}>
               进入广场
+            </button>
+            <button type="button" className="home-nav-action" onClick={onCanvas}>
+              画布模式
             </button>
             <button type="button" className="home-admin-link" onClick={onAdmin}>
               <ShieldCheck size={16} />
@@ -8305,6 +9933,9 @@ function HomePage({ onEnter, onSquare, onAdmin, oauthUser, onOauthLogout }: {
             </button>
             <button type="button" className="home-secondary" onClick={onSquare}>
               浏览广场
+            </button>
+            <button type="button" className="home-secondary" onClick={onCanvas}>
+              画布模式
             </button>
           </div>
           <div className="home-metric-row" aria-label="产品能力摘要">
@@ -8417,10 +10048,12 @@ function SquarePage({
   apiKey,
   onBackHome,
   onEnterStudio,
+  onCanvas,
 }: {
   apiKey: string;
   onBackHome: () => void;
   onEnterStudio: () => void;
+  onCanvas: () => void;
 }) {
   const [tab, setTab] = useState<SquareFeedTab>("latest");
   const [items, setItems] = useState<SquareFeedItem[]>([]);
@@ -8560,6 +10193,9 @@ function SquarePage({
           <button type="button" className="subtle-button" onClick={onEnterStudio}>
             <WandSparkles size={16} />
             工作台
+          </button>
+          <button type="button" className="subtle-button" onClick={onCanvas}>
+            画布
           </button>
           <button type="button" className="subtle-button" onClick={onBackHome}>
             首页
