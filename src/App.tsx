@@ -3172,6 +3172,16 @@ function preferModel(models: string[], current: string) {
   );
 }
 
+// 只取上游真实返回、且在白名单内、且与当前协议匹配的生图模型。
+// 这是「用户这把 Key 到底能不能生图」的唯一判据。
+function upstreamImageModels(protocol: ImageProtocol, upstreamModels: string[] = []) {
+  return filterAllowedImageModels(upstreamModels)
+    .filter((model) => protocolMatchesImageModel(protocol, model));
+}
+
+// 含协议默认模型的列表，仅用于「尚未验证 Key」时的界面预览。
+// 注意：绝不能拿它当作可生成的依据——默认模型是本地常量，
+// 用户的 Key 未必有权限，混进去会让按钮可点、点了却在上游失败。
 function imageModelsForProtocol(protocol: ImageProtocol, upstreamModels: string[] = []) {
   return filterAllowedImageModels([
     ...upstreamModels,
@@ -3796,14 +3806,23 @@ export default function App() {
 
   const selectableImageModels = useMemo(
     () => {
-      // 配置已加载时，只显示后台模型白名单里启用的模型（精确、按配置排序）
+      // Key 已验证：只列出「后台白名单 ∩ 这把 Key 实际可用」的模型。
+      // 列白名单全量会让用户选到自己没权限的模型，点了才在上游失败。
+      if (isModelConnectionVerified && models.length > 0) {
+        if (runtimeModelConfig.length > 0) {
+          const owned = new Set(models.map((m) => normalizedModelId(m)));
+          return runtimeModelConfig.map((m) => m.id).filter((id) => owned.has(normalizedModelId(id)));
+        }
+        return models;
+      }
+      // 未验证时展示白名单全量，仅供预览（此时 canGenerate 本就为 false）
       if (runtimeModelConfig.length > 0) {
         return runtimeModelConfig.map((m) => m.id);
       }
       return filterAllowedImageModels([...models, ...PRIMARY_IMAGE_MODELS]);
     },
     // configVersion 参与依赖：配置拉取完成后重新计算，剔除非白名单模型
-    [models, configVersion],
+    [models, configVersion, isModelConnectionVerified],
   );
   const filteredModels = useMemo(() => {
     const query = modelFilter.trim().toLowerCase();
@@ -3874,6 +3893,22 @@ export default function App() {
     isModelConnectionVerified &&
     aspectRatioSupported;
   const canRequestGenerate = canGenerate && !isPromptAnalyzing && !analysisCountdown && !isAgentModeBusy;
+  // 按钮变灰必须说得出原因，否则用户只会反复点击然后困惑
+  const blockedReason = (() => {
+    if (canGenerate) return "";
+    if (apiConfig.apiKey.trim().length < API_KEY_MIN_LENGTH) return "请先填写 API Key";
+    if (modelState.status === "loading" || isAutoLoadingModels) return "正在验证 API Key 并读取模型";
+    if (modelState.status === "error") return modelState.message || "API Key 验证失败";
+    if (!isModelConnectionVerified) return "等待 API Key 验证通过";
+    if (models.length === 0 || selectableImageModels.length === 0) {
+      return "该 API Key 下没有可用的生图模型，请更换 Key 或联系服务商开通";
+    }
+    if (!selectedModel) return "请选择一个生图模型";
+    if (!models.includes(selectedModel)) return `当前 Key 没有 ${selectedModel} 的权限，请换一个模型`;
+    if (!aspectRatioSupported) return "当前宽高比不被该模型支持";
+    if (!prompt.trim()) return "请输入提示词";
+    return "暂时无法生成";
+  })();
   const canUseSquareIdentity = apiConfig.apiKey.trim().length >= API_KEY_MIN_LENGTH;
 
   useEffect(() => {
@@ -4963,10 +4998,15 @@ export default function App() {
       if (upstreamModels.length === 0) {
         throw new Error("接口返回了空模型列表");
       }
-      const nextModels = imageModelsForProtocol(config.protocol, upstreamModels);
+      // 只认上游真实返回的生图模型：把协议默认模型混进来会让「没有生图权限的 Key」
+      // 也通过验证，用户点生成才在上游失败
+      const nextModels = upstreamImageModels(config.protocol, upstreamModels);
       const nextAnalysisModels = filterAnalysisModels(upstreamModels);
       if (nextModels.length === 0) {
-        throw new Error("未找到可用的图片模型");
+        const allowed = runtimeModelConfig.length > 0
+          ? runtimeModelConfig.map((m) => m.displayName || m.id).slice(0, 4).join("、")
+          : "gpt-image-2 系列";
+        throw new Error(`该 API Key 下没有可用的生图模型（需要 ${allowed} 之一），请更换 Key 或联系服务商开通`);
       }
       const nextSelectedModel = preferModel(nextModels, selectedModel);
       const nextSelectedAnalysisModel = preferAnalysisModel(nextAnalysisModels, selectedAnalysisModel);
@@ -8005,13 +8045,15 @@ export default function App() {
               type="button"
               className={`send-button${isSendLaunching ? " is-launching" : ""}`}
               title={
-                isAgentModeEnabled
-                  ? agentModeState.status === "analyzing"
-                    ? "正在理解任务"
-                    : "开始由 Agent 自动编排"
-                  : isPromptAnalyzing
-                    ? "正在分析提示词"
-                    : "生成"
+                blockedReason
+                  ? blockedReason
+                  : isAgentModeEnabled
+                    ? agentModeState.status === "analyzing"
+                      ? "正在理解任务"
+                      : "开始由 Agent 自动编排"
+                    : isPromptAnalyzing
+                      ? "正在分析提示词"
+                      : "生成"
               }
               aria-label={isAgentModeEnabled ? "开始 Agent 编排" : "生成图片"}
               disabled={!canRequestGenerate}
@@ -8057,8 +8099,9 @@ export default function App() {
                 <span className={referenceIssueCount > 0 ? "has-error" : referenceWarningCount > 0 ? "has-warning" : ""}>
                   {referenceMetaLabel}
                 </span>
-                {!aspectRatioSupported && (
-                  <span className="composer-config-meta has-error">当前比例不被该模型支持</span>
+                {/* 只在「有提示词但仍不能生成」时提示——空输入框时提示「请输入提示词」是噪声 */}
+                {blockedReason && prompt.trim().length > 0 && (
+                  <span className="composer-config-meta has-error">{blockedReason}</span>
                 )}
                 <label className="composer-auto-toggle" title="发送前自动优化提示词">
                   <input
