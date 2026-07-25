@@ -169,7 +169,8 @@ type StoredHistoryRecord = {
   params: ImageParams;
   referenceImages?: UploadedReference[];
   submittedReferenceImages?: SubmittedReference[];
-  status: "success" | "error";
+  // 异步生成：queued/running 也要落库，否则关掉页面就失去了找回任务的凭据
+  status: "queued" | "running" | "success" | "error";
   createdAt: number;
   startedAt?: number;
   finishedAt?: number;
@@ -705,6 +706,8 @@ type CanvasNode = {
   duration?: number;
   imageWidth?: number;
   imageHeight?: number;
+  // 服务端任务 ID：页面关闭后靠它去 /api/tasks 把结果找回来
+  requestId?: string;
   // objectUrl 是原图（下载/优化取参考图用）；thumbUrl 是画布上渲染用的缩略图
   objectUrl?: string;
   thumbUrl?: string;
@@ -4380,6 +4383,179 @@ export default function App() {
     }
   }
 
+  // ── Studio 任务对账 ──────────────────────────────────────────
+  // 服务端异步执行后，结果不再随 POST 返回。这里轮询 /api/tasks，
+  // 把 queued/running 的记录推进到终态，并把图片取回本地。
+  // 关掉页面再回来同样走这条路径——这正是「关页面不丢」的实现。
+  const visibleRecordsRef = useRef<Job[]>([]);
+  visibleRecordsRef.current = visibleRecords;
+  const reconcilingRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const reconcile = async () => {
+      if (reconcilingRef.current) return;
+      const pending = visibleRecordsRef.current.filter(
+        (job) => (job.status === "queued" || job.status === "running") && job.requestId,
+      );
+      if (pending.length === 0) return;
+      reconcilingRef.current = true;
+      try {
+        const ids = pending.map((j) => j.requestId).join(",");
+        const res = await fetch(
+          `/api/tasks?clientId=${encodeURIComponent(getClientId())}&ids=${encodeURIComponent(ids)}`,
+        );
+        const data = await res.json() as {
+          ok: boolean;
+          tasks?: Array<{
+            requestId: string; status: string; durationMs?: number; stages?: JobStages;
+            errorMessage?: string; images?: Array<{ url: string }>;
+          }>;
+        };
+        if (cancelled || !data.ok || !data.tasks) return;
+        const byId = new Map(data.tasks.map((t) => [t.requestId, t]));
+
+        for (const job of pending) {
+          const task = byId.get(job.requestId as string);
+          if (!task) continue;
+          if (task.status === "queued" || task.status === "running") {
+            // 状态可能从 queued 前进到 running，同步一下让 UI 有反馈
+            if (task.status !== job.status) {
+              patchVisibleRecord(job.id, { status: task.status as JobStatus, stages: task.stages });
+            }
+            continue;
+          }
+          if (task.status === "success" && task.images?.[0]?.url) {
+            try {
+              const blob = await generatedImageToBlob({ url: task.images[0].url });
+              if (cancelled) return;
+              const objectUrl = URL.createObjectURL(blob);
+              const { width, height } = await getImageSize(objectUrl);
+              const thumb = await createListThumbnail(blob);
+              const thumbUrl = thumb ? URL.createObjectURL(thumb.blob) : undefined;
+              if (cancelled) return;
+              const finishedAt = Date.now();
+              patchVisibleRecord(job.id, {
+                status: "success",
+                imageBlob: blob,
+                imageUrl: objectUrl,
+                thumbUrl,
+                width,
+                height,
+                finishedAt,
+                durationMs: task.durationMs,
+                stages: task.stages,
+              });
+              const record: StoredHistoryRecord = {
+                id: job.id,
+                requestId: job.requestId,
+                batchId: job.batchId,
+                index: job.index,
+                total: job.total,
+                protocol: job.protocol,
+                prompt: job.prompt,
+                model: job.model,
+                params: job.params,
+                referenceImages: referenceImagesForHistory(job.referenceImages),
+                submittedReferenceImages: job.submittedReferenceImages,
+                status: "success",
+                createdAt: job.createdAt,
+                startedAt: job.startedAt,
+                finishedAt,
+                durationMs: task.durationMs,
+                imageBlob: blob,
+                thumbBlob: thumb?.blob,
+                thumbWidth: thumb?.width,
+                thumbHeight: thumb?.height,
+                width,
+                height,
+                agentId: job.agentId,
+                agentName: job.agentName,
+                agentScenario: job.agentScenario,
+                promptVariant: job.promptVariant,
+              };
+              await saveHistoryRecord(record);
+              setSidebarRecords((current) => mergeHistoryRecords(current, [{
+                ...record,
+                referenceImages: normalizeStoredReferenceImages(record.referenceImages),
+                objectUrl,
+                thumbUrl,
+              }]));
+              // 补传缩略图给服务端供管理后台用：任务在用户离线时完成的话，
+              // 这是唯一的补齐时机（服务端没有图片处理能力）
+              if (thumb && job.requestId) {
+                void blobToDataUrl(thumb.blob)
+                  .then((thumbnailDataUrl) => fetch("/api/images/thumb", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ requestId: job.requestId, index: 0, thumbnailDataUrl, clientId: getClientId() }),
+                  }))
+                  .catch(() => undefined);
+              }
+            } catch {
+              // 图取不回来（多半是被日志裁剪清理了）才判失败
+              patchVisibleRecord(job.id, {
+                status: "error",
+                errorDetail: { error: "图片已被服务器清理" },
+                finishedAt: Date.now(),
+              });
+            }
+          } else if (task.status === "error") {
+            const finishedAt = Date.now();
+            const errorDetail = { error: task.errorMessage || "生成失败" };
+            patchVisibleRecord(job.id, {
+              status: "error",
+              errorDetail,
+              finishedAt,
+              durationMs: task.durationMs,
+              stages: task.stages,
+            });
+            // 必须同时落库：只改内存的话，刷新后记录会以 queued 重新加载，
+            // 然后再次对账、再次只改内存——永远推进不到终态
+            const failed: StoredHistoryRecord = {
+              id: job.id,
+              requestId: job.requestId,
+              batchId: job.batchId,
+              index: job.index,
+              total: job.total,
+              protocol: job.protocol,
+              prompt: job.prompt,
+              model: job.model,
+              params: job.params,
+              referenceImages: referenceImagesForHistory(job.referenceImages),
+              submittedReferenceImages: job.submittedReferenceImages,
+              status: "error",
+              createdAt: job.createdAt,
+              startedAt: job.startedAt,
+              finishedAt,
+              durationMs: task.durationMs,
+              errorDetail,
+              agentId: job.agentId,
+              agentName: job.agentName,
+              agentScenario: job.agentScenario,
+              promptVariant: job.promptVariant,
+            };
+            await saveHistoryRecord(failed);
+            setSidebarRecords((current) => mergeHistoryRecords(current, [{
+              ...failed,
+              referenceImages: normalizeStoredReferenceImages(failed.referenceImages),
+            }]));
+          }
+        }
+      } catch {
+        // 单轮对账失败不影响使用，下一轮重试
+      } finally {
+        reconcilingRef.current = false;
+      }
+    };
+
+    void reconcile();
+    const timer = window.setInterval(() => { void reconcile(); }, 2000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function patchVisibleRecord(id: string, patch: Partial<Job>) {
     setVisibleRecords((current) =>
       sortGenerationRecords(current.map((record) => (record.id === id ? { ...record, ...patch } : record))),
@@ -5042,6 +5218,10 @@ export default function App() {
         params: requestParamsForLog,
       });
 
+      // 预分配任务 ID：服务端异步执行，前端必须在发请求前就持有 ID，
+      // 否则页面一关就永远失去了与那个任务的映射
+      const plannedRequestId = job.requestId
+        || (typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : "");
       const response = await fetch("/api/images/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -5049,6 +5229,7 @@ export default function App() {
           baseUrl: normalizeApiBaseUrl(config.baseUrl),
           apiKey: config.apiKey,
           clientId: getClientId(),
+          requestId: plannedRequestId,
           request: {
             batchId: job.batchId,
             index: job.index,
@@ -5072,57 +5253,25 @@ export default function App() {
         }),
       });
       const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
-      if (!response.ok || !payload.ok || !(payload.images?.[0]?.url || payload.images?.[0]?.dataUrl)) {
+      // 入队失败（配额 429 / 校验 400 / 队列满 503）才 throw，走原有的重试与错误路径
+      if (!response.ok || !payload.ok) {
         throw payload.detail && typeof payload.detail === "object"
           ? { ...payload.detail as Record<string, unknown>, requestId: payload.requestId, stages: payload.stages }
           : { error: payload.detail || payload, requestId: payload.requestId, stages: payload.stages };
       }
 
-      const blob = await generatedImageToBlob(payload.images[0]);
-      const objectUrl = URL.createObjectURL(blob);
-      const { width, height } = await getImageSize(objectUrl);
-      const finishedAt = Date.now();
-      const durationMs = finishedAt - startedAt;
-      const revisedPrompt = payload.images[0].revisedPrompt || "";
-      const successSummary: ReferenceSummary = preparedSummary.hasReferences && preparedSummary.status === "prepared"
-        ? { ...preparedSummary, status: "sent_ok" }
-        : preparedSummary;
-      pushLocalLog({
-        type: "image_generation",
-        level: "success",
-        title: `图片生成成功 #${job.index}/${job.total}${successSummary.hasReferences ? ` · 参考图 ${successSummary.count} 张已上传` : " · 无参考图"}`,
-        message: `生成完成，尺寸 ${width} x ${height}。${successSummary.hasReferences ? `参考图 ${successSummary.count} 张${successSummary.totalBytes > 0 ? `（${formatBytes(successSummary.totalBytes)}）` : ""}已发送给上游。` : ""}`,
-        endpoint: "/api/images/generate",
-        requestId: payload.requestId,
-        durationMs,
-        referenceSummary: successSummary,
-        params: requestParamsForLog,
-        response: {
-          width,
-          height,
-          revisedPrompt: truncateForLog(revisedPrompt || "", 500),
-          imageCount: payload.images.length,
-          proxyResponse: sanitizeClientLogValue(payload),
-        },
-      });
-
+      const acceptedRequestId = payload.requestId || plannedRequestId;
+      // 入队成功：记录转入「排队中」并落库。此后不再等待图片——
+      // 服务端在后台执行，由 useTaskReconcile 轮询把结果取回来。
       patchVisibleRecord(job.id, {
-        requestId: payload.requestId,
-        status: "success",
-        imageBlob: blob,
-        imageUrl: objectUrl,
-        width,
-        height,
-        revisedPrompt,
+        requestId: acceptedRequestId,
+        status: "queued",
         startedAt,
-        finishedAt,
-        durationMs,
         stages: payload.stages,
       });
-
-      const historyRecord: StoredHistoryRecord = {
+      await saveHistoryRecord({
         id: job.id,
-        requestId: payload.requestId,
+        requestId: acceptedRequestId,
         batchId: job.batchId,
         index: job.index,
         total: job.total,
@@ -5132,53 +5281,16 @@ export default function App() {
         params: job.params,
         referenceImages: referenceImagesForHistory(job.referenceImages),
         submittedReferenceImages: submittedRefSnapshot.length > 0 ? submittedRefSnapshot : undefined,
-        status: "success",
+        status: "queued",
         createdAt: job.createdAt,
         startedAt,
-        finishedAt,
-        durationMs,
-        imageBlob: blob,
-        width,
-        height,
-        revisedPrompt,
         agentId: job.agentId,
         agentName: job.agentName,
         agentScenario: job.agentScenario,
         promptVariant: job.promptVariant,
-      };
-      await saveHistoryRecord(historyRecord);
-      setSidebarRecords((current) => mergeHistoryRecords(current, [{
-        ...historyRecord,
-        referenceImages: normalizeStoredReferenceImages(historyRecord.referenceImages),
-        objectUrl,
-      }]));
-
-      // 缩略图在图已经显示之后再算：解码 + WebP 编码是主线程活儿，不能挡在用户看到图之前。
-      // 失败或未完成时，所有渲染点的 `thumbUrl ?? objectUrl` 会回退原图。
-      void createListThumbnail(blob).then(async (thumb) => {
-        if (!thumb) return;
-        const patch = { thumbBlob: thumb.blob, thumbWidth: thumb.width, thumbHeight: thumb.height };
-        try {
-          await saveHistoryRecord({ ...historyRecord, ...patch });
-        } catch {
-          return;
-        }
-        const thumbUrl = URL.createObjectURL(thumb.blob);
-        patchVisibleRecord(job.id, { thumbUrl });
-        setSidebarRecords((current) => current.map((r) => (r.id === job.id ? { ...r, ...patch, thumbUrl } : r)));
-        if (payload.requestId) {
-          // 供管理后台列表用；fire-and-forget，失败不影响用户
-          void blobToDataUrl(thumb.blob)
-            .then((thumbnailDataUrl) =>
-              fetch("/api/images/thumb", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ requestId: payload.requestId, index: 0, thumbnailDataUrl, clientId: getClientId() }),
-              }),
-            )
-            .catch(() => undefined);
-        }
       });
+      return;
+
     } catch (error) {
       const finishedAt = Date.now();
       const durationMs = finishedAt - startedAt;
@@ -7295,12 +7407,34 @@ export default function App() {
               <Send size={16} />
             </button>
           )}
-          <AgentModeSwitch
-            enabled={isAgentModeEnabled}
-            status={agentModeState.status}
-            onToggle={() => setIsAgentModeEnabled((value) => !value)}
-          />
-          {!isAgentModeEnabled && (
+          {isAgentModeEnabled ? (
+            <AgentModeSwitch
+              enabled
+              status={agentModeState.status}
+              onToggle={() => setIsAgentModeEnabled((value) => !value)}
+            />
+          ) : (
+            // 未启用的功能全部收进这一行 chip，点开才展开，避免 composer 常驻五层
+            <div className="composer-toolbar">
+              <AgentModeSwitch
+                enabled={false}
+                status={agentModeState.status}
+                onToggle={() => setIsAgentModeEnabled((value) => !value)}
+              />
+              {!isAgentEnabled && !lastAppliedAgent && (
+                <button
+                  type="button"
+                  className="composer-tool-chip"
+                  onClick={() => openAgentPanel()}
+                  title="选择行业工作流，不填也能生成标准图"
+                >
+                  <WandSparkles size={14} />
+                  行业 Agent
+                </button>
+              )}
+            </div>
+          )}
+          {!isAgentModeEnabled && (isAgentEnabled || lastAppliedAgent) && (
             <div className="agent-quickbar">
               <button
                 type="button"
@@ -7923,9 +8057,9 @@ export default function App() {
                 <span className={referenceIssueCount > 0 ? "has-error" : referenceWarningCount > 0 ? "has-warning" : ""}>
                   {referenceMetaLabel}
                 </span>
-                <span className={`composer-config-meta ${aspectRatioSupported ? "" : "has-error"}`}>
-                  {composerConfigSummary} · {resolvedRequestSize} · {params.outputFormat.toUpperCase()}
-                </span>
+                {!aspectRatioSupported && (
+                  <span className="composer-config-meta has-error">当前比例不被该模型支持</span>
+                )}
                 <label className="composer-auto-toggle" title="发送前自动优化提示词">
                   <input
                     type="checkbox"
@@ -8669,6 +8803,91 @@ function AdminConfigCenter() {
   );
 }
 
+type CaptchaChallenge = { token: string; gapY: number; trackWidth: number; pieceSize: number; background: string; piece: string };
+
+// 滑块拼图：背景与缺口全部用 CSS/SVG 生成，不需要任何图片处理依赖。
+// 服务端只下发 gapY（视觉用）与 token，正确的 gapX 始终留在服务端校验。
+function SliderCaptcha({ challenge, onSolved, onRefresh, error, solved }: {
+  challenge: CaptchaChallenge | null;
+  onSolved: (x: number) => void;
+  onRefresh: () => void;
+  error: string;
+  solved: boolean;
+}) {
+  const [x, setX] = useState(0);
+  const [dragging, setDragging] = useState(false);
+  const trackRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => { setX(0); }, [challenge?.token]);
+
+  const maxX = challenge ? challenge.trackWidth - challenge.pieceSize : 0;
+
+  const startDrag = (clientX: number) => {
+    if (solved || !challenge) return;
+    setDragging(true);
+    const rect = trackRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const move = (cx: number) => {
+      const next = Math.max(0, Math.min(maxX, cx - rect.left - challenge.pieceSize / 2));
+      setX(next);
+    };
+    move(clientX);
+    const onMove = (e: PointerEvent) => move(e.clientX);
+    const onUp = (e: PointerEvent) => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      setDragging(false);
+      const final = Math.max(0, Math.min(maxX, e.clientX - rect.left - challenge.pieceSize / 2));
+      setX(final);
+      onSolved(Math.round(final));
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+
+  if (!challenge) {
+    return <div className="captcha-box captcha-loading"><Loader2 size={16} className="spin" /> 正在加载验证…</div>;
+  }
+
+  return (
+    <div className="captcha-box">
+      <div className="captcha-stage" ref={trackRef} style={{ width: challenge.trackWidth }}>
+        {/* 缺口位置只存在于这张图的像素里，接口响应中没有坐标 */}
+        <img className="captcha-bg" src={challenge.background} alt="拖动拼图对齐缺口" draggable={false} />
+        <img
+          className={`captcha-piece${solved ? " is-solved" : ""}`}
+          src={challenge.piece}
+          alt=""
+          draggable={false}
+          style={{ top: challenge.gapY, left: x, width: challenge.pieceSize, height: challenge.pieceSize }}
+        />
+      </div>
+      <div className="captcha-track">
+        <div
+          className={`captcha-handle${dragging ? " is-dragging" : ""}${solved ? " is-solved" : ""}`}
+          style={{ left: x }}
+          onPointerDown={(e) => { e.preventDefault(); startDrag(e.clientX); }}
+          role="slider"
+          aria-label="拖动滑块完成验证"
+          aria-valuenow={Math.round(x)}
+          aria-valuemin={0}
+          aria-valuemax={maxX}
+          tabIndex={0}
+        >
+          {solved ? <CheckCircle2 size={16} /> : <ChevronRight size={16} />}
+        </div>
+        <span className="captcha-hint">{solved ? "验证通过" : "按住滑块拖动完成拼图"}</span>
+      </div>
+      {error && (
+        <div className="captcha-error">
+          {error}
+          <button type="button" onClick={onRefresh}>换一个</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AdminApp({
   onBackHome,
   onEnterStudio,
@@ -8694,6 +8913,11 @@ function AdminApp({
   const [isChecking, setIsChecking] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [loginForm, setLoginForm] = useState({ username: "admin", password: "" });
+  const [captchaRequired, setCaptchaRequired] = useState(false);
+  const [captcha, setCaptcha] = useState<CaptchaChallenge | null>(null);
+  const [captchaX, setCaptchaX] = useState<number | null>(null);
+  const [captchaError, setCaptchaError] = useState("");
+  const [lockedUntil, setLockedUntil] = useState(0);
   const [passwordForm, setPasswordForm] = useState({ oldPassword: "", newPassword: "", confirmPassword: "" });
   const [adminError, setAdminError] = useState("");
   const [stats, setStats] = useState<AdminStats | null>(null);
@@ -8813,18 +9037,71 @@ function AdminApp({
     }
   }
 
+  async function loadCaptcha() {
+    setCaptchaError("");
+    setCaptchaX(null);
+    setCaptcha(null);
+    try {
+      const data = await adminFetch<CaptchaChallenge & { ok: true }>("/captcha");
+      setCaptcha({
+        token: data.token, gapY: data.gapY, trackWidth: data.trackWidth,
+        pieceSize: data.pieceSize, background: data.background, piece: data.piece,
+      });
+    } catch {
+      setCaptchaError("验证加载失败，请点「换一个」重试");
+    }
+  }
+
+  // 进页先问一次：之前失败过就直接显示滑块，别等用户白试一次
+  useEffect(() => {
+    if (user) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const data = await adminFetch<{ ok: true; captchaRequired: boolean; lockedUntil: number }>(
+          `/login-state?username=${encodeURIComponent(loginForm.username)}`,
+        );
+        if (cancelled) return;
+        setLockedUntil(data.lockedUntil || 0);
+        if (data.captchaRequired) {
+          setCaptchaRequired(true);
+          void loadCaptcha();
+        }
+      } catch { /* 前置查询失败不阻塞登录 */ }
+    })();
+    return () => { cancelled = true; };
+  }, [user]);
+
   async function handleLogin(event: FormEvent) {
     event.preventDefault();
     setAdminError("");
     setIsSubmitting(true);
     try {
+      if (captchaRequired && (!captcha || captchaX === null)) {
+        setAdminError("请先拖动滑块完成验证");
+        setIsSubmitting(false);
+        return;
+      }
       const payload = await adminFetch<{ ok: true; user: AdminUserView }>("/login", {
         method: "POST",
-        body: JSON.stringify(loginForm),
+        body: JSON.stringify({
+          ...loginForm,
+          ...(captchaRequired && captcha ? { captchaToken: captcha.token, captchaX } : {}),
+        }),
       });
       setUser(payload.user);
+      setCaptchaRequired(false);
+      setCaptcha(null);
       setPasswordForm((current) => ({ ...current, oldPassword: loginForm.password }));
     } catch (error) {
+      const detail = (error && typeof error === "object" ? error as Record<string, unknown> : {});
+      if (typeof detail.lockedUntil === "number" && detail.lockedUntil > Date.now()) {
+        setLockedUntil(detail.lockedUntil);
+      }
+      if (detail.captchaRequired) {
+        setCaptchaRequired(true);
+        void loadCaptcha();
+      }
       setAdminError(formatError(error));
     } finally {
       setIsSubmitting(false);
@@ -8969,8 +9246,22 @@ function AdminApp({
                 placeholder="默认 admin123456"
               />
             </label>
+            {captchaRequired && (
+              <SliderCaptcha
+                challenge={captcha}
+                onSolved={(x) => { setCaptchaX(x); setCaptchaError(""); }}
+                onRefresh={() => void loadCaptcha()}
+                error={captchaError}
+                solved={captchaX !== null}
+              />
+            )}
+            {lockedUntil > Date.now() && (
+              <div className="admin-error">
+                登录尝试过于频繁，请于 {new Date(lockedUntil).toLocaleTimeString("zh-CN")} 后重试
+              </div>
+            )}
             {adminError && <div className="admin-error">{adminError}</div>}
-            <button className="primary-action" type="submit" disabled={isSubmitting}>
+            <button className="primary-action" type="submit" disabled={isSubmitting || lockedUntil > Date.now()}>
               {isSubmitting ? <Loader2 size={17} className="spin" /> : <ShieldCheck size={17} />}
               登录
             </button>
@@ -9496,16 +9787,19 @@ const CanvasNodeView = memo(function CanvasNodeView({
   node,
   selected,
   dragging,
+  lodTier,
   handlersRef,
 }: {
   node: CanvasNode;
   selected: boolean;
   dragging: boolean;
+  lodTier: "thumb" | "full";
   handlersRef: { current: CanvasNodeHandlers };
 }) {
   return (
     <div
       className={`canvas-node ${node.status} ${selected ? "selected" : ""} ${dragging ? "dragging" : ""}`}
+      data-node-id={node.id}
       style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
       onPointerDown={(e) => handlersRef.current.onNodePointerDown(e, node)}
       onDoubleClick={() => {
@@ -9513,7 +9807,14 @@ const CanvasNodeView = memo(function CanvasNodeView({
       }}
     >
       {node.status === "success" && node.objectUrl && (
-        <img src={node.thumbUrl ?? node.objectUrl} alt="" draggable={false} className="canvas-node-image" />
+        <img
+          // 缩略图只有 512px：节点默认 280px 宽，在 Retina 上就需要 560px，
+          // 所以只有缩小到缩略图够用时才降级，否则一律原图，避免画布上看到糊图
+          src={lodTier === "thumb" ? (node.thumbUrl ?? node.objectUrl) : node.objectUrl}
+          alt=""
+          draggable={false}
+          className="canvas-node-image"
+        />
       )}
       {node.status === "generating" && (
         <div className="canvas-node-skeleton">
@@ -9540,7 +9841,8 @@ const CanvasNodeView = memo(function CanvasNodeView({
 }, (prev, next) =>
   prev.node === next.node &&
   prev.selected === next.selected &&
-  prev.dragging === next.dragging
+  prev.dragging === next.dragging &&
+  prev.lodTier === next.lodTier
 );
 
 function CanvasPage({
@@ -9574,6 +9876,14 @@ function CanvasPage({
   const [canvasSize, setCanvasSize] = useState("");
   const [canvasQuality, setCanvasQuality] = useState("auto");
   const [isGenerating, setIsGenerating] = useState(false);
+  // 画布并发上限 6。异步化后 fetch 是毫秒级返回的，用「在途请求数」计数已无意义——
+  // 改为统计**未完成节点数**（generating），这才是用户理解的「同时在生成几张」。
+  const CANVAS_MAX_CONCURRENCY = 6;
+  const canvasRunning = canvasNodes.filter((n) => n.status === "generating").length;
+  const canvasRunningRef = useRef(0);
+  canvasRunningRef.current = canvasRunning;
+  const canvasAtCapacity = canvasRunning >= CANVAS_MAX_CONCURRENCY;
+  const bumpRunning = (_delta: number) => { /* 保留调用点，计数已改为派生自节点状态 */ };
   const [optimizeSourceNode, setOptimizeSourceNode] = useState<CanvasNode | null>(null);
   const [optimizePrompt, setOptimizePrompt] = useState("");
   const [compressedRef, setCompressedRef] = useState<{ dataUrl: string; size: number } | null>(null);
@@ -9582,6 +9892,8 @@ function CanvasPage({
   const [canvasLoaded, setCanvasLoaded] = useState(false);
   const [isMinimapVisible, setIsMinimapVisible] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ nodeId: string; x: number; y: number; canvasX?: number; canvasY?: number } | null>(null);
+  const [originalPreview, setOriginalPreview] = useState<CanvasNode | null>(null);
 
   // ── Refs ──
   const containerRef = useRef<HTMLDivElement>(null);
@@ -9589,6 +9901,8 @@ function CanvasPage({
   const optimizePromptRef = useRef<HTMLTextAreaElement>(null);
   const nodesRef = useRef(canvasNodes);
   nodesRef.current = canvasNodes;
+  const selectedNodeIdRef = useRef<string | null>(null);
+  selectedNodeIdRef.current = selectedNodeId;
   const edgesRef = useRef(canvasEdges);
   edgesRef.current = canvasEdges;
   const viewportRef = useRef(viewport);
@@ -9615,7 +9929,109 @@ function CanvasPage({
         el.style.backgroundPosition = `${(-vp.x * vp.zoom) % rendered}px ${(-vp.y * vp.zoom) % rendered}px`;
       }
     }
+    applyCulling();
   };
+
+  // 视口裁剪：视口外的节点只 display:none，**保留在 DOM 中**。
+  // 卸载会让图片重新解码、objectUrl 重绑，滚回来会闪白；置 display 则是纯样式操作。
+  // 直接改 DOM style 而不走 setState —— 平移每帧都会调用，走 React 会全量重渲染。
+  const applyCulling = () => {
+    const layer = transformLayerRef.current;
+    const el = containerRef.current;
+    if (!layer || !el) return;
+    const vp = viewportRef.current;
+    const rect = el.getBoundingClientRect();
+    // 画布坐标系下的可视矩形，外扩一屏做缓冲，避免边缘频繁进出
+    const padX = rect.width / vp.zoom;
+    const padY = rect.height / vp.zoom;
+    const minX = vp.x - padX * 0.5;
+    const minY = vp.y - padY * 0.5;
+    const maxX = vp.x + padX * 1.5;
+    const maxY = vp.y + padY * 1.5;
+    for (const node of nodesRef.current) {
+      const dom = layer.querySelector<HTMLElement>(`.canvas-node[data-node-id="${node.id}"]`);
+      if (!dom) continue;
+      // 选中节点与生成中节点永不裁剪：否则拖出视口时选中框消失、看不到 loading
+      const exempt = node.id === selectedNodeIdRef.current || node.status === "generating";
+      const visible =
+        exempt ||
+        (node.x + node.width >= minX && node.x <= maxX && node.y + node.height >= minY && node.y <= maxY);
+      const next = visible ? "" : "none";
+      if (dom.style.display !== next) dom.style.display = next;
+    }
+  };
+  // 任务对账：页面关闭时仍在 generating 的节点，用 requestId 去服务端查真实结果。
+  // 服务端不会因为客户端断开而中止，图往往已经生成好并落盘了——这里把它找回来。
+  useEffect(() => {
+    if (!canvasLoaded) return;
+    let cancelled = false;
+    let timer = 0;
+
+    const reconcile = async () => {
+      const pending = nodesRef.current.filter((n) => n.status === "generating" && n.requestId);
+      if (pending.length === 0) return;
+      try {
+        const ids = pending.map((n) => n.requestId).join(",");
+        const res = await fetch(`/api/tasks?clientId=${encodeURIComponent(getClientId())}&ids=${encodeURIComponent(ids)}`);
+        const data = await res.json() as { ok: boolean; tasks?: Array<{ requestId: string; status: string; images?: Array<{ url: string }>; errorMessage?: string }> };
+        if (cancelled || !data.ok || !data.tasks) return;
+        const byId = new Map(data.tasks.map((t) => [t.requestId, t]));
+
+        for (const node of pending) {
+          const task = byId.get(node.requestId as string);
+          if (!task) continue;
+          if (task.status === "success" && task.images?.[0]?.url) {
+            try {
+              const blob = await generatedImageToBlob({ url: task.images[0].url });
+              if (cancelled) return;
+              const objectUrl = URL.createObjectURL(blob);
+              const { width, height } = await getImageSize(objectUrl);
+              const thumb = await createListThumbnail(blob);
+              const thumbUrl = thumb ? URL.createObjectURL(thumb.blob) : undefined;
+              await saveCanvasImageToDB(node.id, blob);
+              if (thumb) await saveCanvasImageToDB(canvasThumbKey(node.id), thumb.blob);
+              if (thumb && node.requestId) {
+                void blobToDataUrl(thumb.blob)
+                  .then((thumbnailDataUrl) => fetch("/api/images/thumb", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ requestId: node.requestId, index: 0, thumbnailDataUrl, clientId: getClientId() }),
+                  }))
+                  .catch(() => undefined);
+              }
+              if (cancelled) return;
+              const adjustedH = Math.round(node.width * (height / width));
+              setCanvasNodes((prev) => prev.map((n) => n.id === node.id
+                ? { ...n, status: "success" as const, objectUrl, thumbUrl, height: adjustedH, imageWidth: width, imageHeight: height }
+                : n));
+            } catch {
+              // 图取不回来（比如已被日志裁剪清理）才判失败
+              setCanvasNodes((prev) => prev.map((n) => n.id === node.id
+                ? { ...n, status: "error" as const, error: "图片已被服务器清理" } : n));
+            }
+          } else if (task.status === "error") {
+            setCanvasNodes((prev) => prev.map((n) => n.id === node.id
+              ? { ...n, status: "error" as const, error: task.errorMessage || "生成失败" } : n));
+          }
+          // status 仍是 running：什么都不做，下一轮继续查
+        }
+      } catch {
+        // 对账失败不影响画布使用，下一轮重试
+      }
+    };
+
+    void reconcile();
+    timer = window.setInterval(() => { void reconcile(); }, 5000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasLoaded]);
+
+  // 节点增删或选中变化后重算一次裁剪：新节点的 DOM 刚挂上，需要初始判定
+  useEffect(() => {
+    applyCulling();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasNodes, selectedNodeId]);
+
   const scheduleViewportPaint = () => {
     if (viewportRafRef.current) return;
     viewportRafRef.current = requestAnimationFrame(() => {
@@ -9695,7 +10111,11 @@ function CanvasPage({
             }
           } else if (node.status === "generating") {
             // Was generating when page closed - mark as error
-            loadedNodes.push({ ...node, status: "error", error: "生成中断（页面关闭）" });
+            // 不再直接判死：服务端不会因为页面关闭而中止，图很可能已经生成好了。
+            // 保持 generating，由对账 effect 用 requestId 去 /api/tasks 查真实结果。
+            loadedNodes.push(node.requestId
+              ? { ...node, status: "generating" as const }
+              : { ...node, status: "error" as const, error: "生成中断（页面关闭）" });
           } else {
             loadedNodes.push(node);
           }
@@ -10002,6 +10422,35 @@ function CanvasPage({
   // ── Context menu prevention ──
   function handleContextMenu(e: React.MouseEvent) {
     e.preventDefault();
+    // 右键落在节点上就开菜单；落在空白处保持原有的平移语义
+    const nodeEl = (e.target as HTMLElement).closest?.(".canvas-node");
+    if (!nodeEl) {
+      // 空白处右键：记下画布坐标，菜单里提供「在此生成」
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (!rect) { setContextMenu(null); return; }
+      const vp = viewportRef.current;
+      setContextMenu({
+        nodeId: "",
+        x: e.clientX,
+        y: e.clientY,
+        canvasX: (e.clientX - rect.left) / vp.zoom + vp.x,
+        canvasY: (e.clientY - rect.top) / vp.zoom + vp.y,
+      });
+      return;
+    }
+    const id = canvasNodes.find((n) => {
+      const el = document.querySelector(`.canvas-node[data-node-id="${n.id}"]`);
+      return el === nodeEl;
+    })?.id;
+    if (!id) return;
+    setSelectedNodeId(id);
+    setContextMenu({ nodeId: id, x: e.clientX, y: e.clientY });
+  }
+
+  function viewOriginal(node: CanvasNode) {
+    if (!node.objectUrl) return;
+    setContextMenu(null);
+    setOriginalPreview(node);
   }
 
   // ── Delete node ──
@@ -10061,20 +10510,27 @@ function CanvasPage({
   }
 
   // ── Generation flow ──
-  async function handleCanvasGenerate() {
+  async function handleCanvasGenerate(options?: { at?: { x: number; y: number }; refNodeIds?: string[] }) {
     const trimmedPrompt = canvasPrompt.trim();
     if (!trimmedPrompt || !canvasModel || modelState.status !== "ready") return;
+    if (canvasRunningRef.current >= CANVAS_MAX_CONCURRENCY) {
+      showToast(`最多同时生成 ${CANVAS_MAX_CONCURRENCY} 张，请等待当前任务完成`);
+      return;
+    }
 
     const aspectNum = aspectRatioToNumber(canvasAspectRatio);
     const nodeW = CANVAS_DEFAULT_NODE_WIDTH;
     const nodeH = Math.round(nodeW / aspectNum);
-    const center = viewportCenter();
-    const pos = findNonOverlappingPos(center.x, center.y, nodeW, nodeH);
+    const anchor = options?.at ?? viewportCenter();
+    const pos = findNonOverlappingPos(anchor.x, anchor.y, nodeW, nodeH);
 
     const nodeId = uid();
+    // 预分配任务 ID 并随节点落库：页面关闭后靠它去 /api/tasks 找回结果
+    const plannedRequestId = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : "";
     const size = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel, canvasSize);
     const newNode: CanvasNode = {
       id: nodeId,
+      requestId: plannedRequestId || undefined,
       type: "image",
       x: pos.x,
       y: pos.y,
@@ -10101,7 +10557,7 @@ function CanvasPage({
 
     setCanvasNodes((prev) => [...prev, newNode]);
     setCanvasPrompt("");
-    setIsGenerating(true);
+    bumpRunning(1);
 
     const startedAt = Date.now();
     try {
@@ -10112,6 +10568,7 @@ function CanvasPage({
           baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
           apiKey: apiConfig.apiKey,
           clientId: getClientId(),
+          requestId: plannedRequestId,
           request: {
             protocol: apiConfig.protocol,
             model: canvasModel,
@@ -10127,43 +10584,26 @@ function CanvasPage({
         }),
       });
       const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
-      if (!response.ok || !payload.ok || !(payload.images?.[0]?.url || payload.images?.[0]?.dataUrl)) {
+      // 只判断「入队是否成功」；图片由服务端后台生成，对账 effect 负责取回
+      if (!response.ok || !payload.ok) {
         const detail = payload.detail && typeof payload.detail === "object"
           ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
           : payload.detail || "生成失败";
         throw new Error(String(detail));
       }
-      const blob = await generatedImageToBlob(payload.images[0]);
-      const objectUrl = URL.createObjectURL(blob);
-      const { width, height } = await getImageSize(objectUrl);
-      // 画布节点用缩略图渲染：30 节点画布的位图内存从 ~500MB 降到 ~30MB
-      const thumb = await createListThumbnail(blob);
-      const thumbUrl = thumb ? URL.createObjectURL(thumb.blob) : undefined;
-      const duration = Date.now() - startedAt;
-      const adjustedH = Math.round(nodeW * (height / width));
-
+      // 入队成功：保持 generating，图片由 useEffect 对账轮询取回并落库。
+      // 这样即使用户此刻关掉页面，服务端也会把它跑完。
       setCanvasNodes((prev) => prev.map((n) =>
-        n.id === nodeId ? {
-          ...n,
-          status: "success" as const,
-          objectUrl,
-          thumbUrl,
-          width: nodeW,
-          height: adjustedH,
-          imageWidth: width,
-          imageHeight: height,
-          duration,
-        } : n
-      ));
-      await saveCanvasImageToDB(nodeId, blob);
-      if (thumb) await saveCanvasImageToDB(canvasThumbKey(nodeId), thumb.blob);
+        n.id === nodeId
+          ? { ...n, requestId: payload.requestId || plannedRequestId || n.requestId }
+          : n));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setCanvasNodes((prev) => prev.map((n) =>
         n.id === nodeId ? { ...n, status: "error" as const, error: message } : n
       ));
     } finally {
-      setIsGenerating(false);
+      bumpRunning(-1);
     }
   }
 
@@ -10197,9 +10637,12 @@ function CanvasPage({
 
     const nodeId = uid();
     const edgeId = uid();
+    // 与生成入口一致地预分配任务 ID，否则这条路径的节点关页面后无法对账
+    const plannedRequestId = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : "";
     const size = resolveRequestSize(canvasAspectRatio, canvasResolution, apiConfig.protocol, canvasModel, canvasSize);
     const newNode: CanvasNode = {
       id: nodeId,
+      requestId: plannedRequestId || undefined,
       type: "image",
       x: newX,
       y: newY,
@@ -10229,7 +10672,7 @@ function CanvasPage({
 
     setCanvasNodes((prev) => [...prev, newNode]);
     setCanvasEdges((prev) => [...prev, newEdge]);
-    setIsGenerating(true);
+    bumpRunning(1);
 
     const startedAt = Date.now();
     try {
@@ -10240,6 +10683,7 @@ function CanvasPage({
           baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
           apiKey: apiConfig.apiKey,
           clientId: getClientId(),
+          requestId: plannedRequestId,
           request: {
             protocol: apiConfig.protocol,
             model: canvasModel,
@@ -10262,54 +10706,39 @@ function CanvasPage({
         }),
       });
       const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
-      if (!response.ok || !payload.ok || !(payload.images?.[0]?.url || payload.images?.[0]?.dataUrl)) {
+      // 只判断「入队是否成功」；图片由服务端后台生成，对账 effect 负责取回
+      if (!response.ok || !payload.ok) {
         const detail = payload.detail && typeof payload.detail === "object"
           ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
           : payload.detail || "生成失败";
         throw new Error(String(detail));
       }
-      const blob = await generatedImageToBlob(payload.images[0]);
-      const objectUrl = URL.createObjectURL(blob);
-      const { width, height } = await getImageSize(objectUrl);
-      // 画布节点用缩略图渲染：30 节点画布的位图内存从 ~500MB 降到 ~30MB
-      const thumb = await createListThumbnail(blob);
-      const thumbUrl = thumb ? URL.createObjectURL(thumb.blob) : undefined;
-      const duration = Date.now() - startedAt;
-      const adjustedH = Math.round(nodeW * (height / width));
-
+      // 入队成功：保持 generating，图片由 useEffect 对账轮询取回并落库。
+      // 这样即使用户此刻关掉页面，服务端也会把它跑完。
       setCanvasNodes((prev) => prev.map((n) =>
-        n.id === nodeId ? {
-          ...n,
-          status: "success" as const,
-          objectUrl,
-          thumbUrl,
-          width: nodeW,
-          height: adjustedH,
-          imageWidth: width,
-          imageHeight: height,
-          duration,
-        } : n
-      ));
-      await saveCanvasImageToDB(nodeId, blob);
-      if (thumb) await saveCanvasImageToDB(canvasThumbKey(nodeId), thumb.blob);
-      // Auto-select new node for chaining
-      setSelectedNodeId(nodeId);
+        n.id === nodeId
+          ? { ...n, requestId: payload.requestId || plannedRequestId || n.requestId }
+          : n));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setCanvasNodes((prev) => prev.map((n) =>
         n.id === nodeId ? { ...n, status: "error" as const, error: message } : n
       ));
     } finally {
-      setIsGenerating(false);
+      bumpRunning(-1);
     }
   }
 
   // ── Retry failed node ──
   async function retryNode(node: CanvasNode) {
+    // 重试是一次全新任务：必须换新 ID，复用旧 ID 会被服务端的去重逻辑拒绝
+    const plannedRequestId = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : "";
     setCanvasNodes((prev) => prev.map((n) =>
-      n.id === node.id ? { ...n, status: "generating" as const, error: undefined } : n
+      n.id === node.id
+        ? { ...n, status: "generating" as const, error: undefined, requestId: plannedRequestId || undefined }
+        : n
     ));
-    setIsGenerating(true);
+    bumpRunning(1);
     const startedAt = Date.now();
     try {
       const referenceImages: SubmittedReference[] = [];
@@ -10336,6 +10765,7 @@ function CanvasPage({
           baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
           apiKey: apiConfig.apiKey,
           clientId: getClientId(),
+          requestId: plannedRequestId,
           request: {
             protocol: node.protocol,
             model: node.model,
@@ -10351,45 +10781,26 @@ function CanvasPage({
         }),
       });
       const payload = await readApiJson<GenerateProxyResponse>(response, "/api/images/generate");
-      if (!response.ok || !payload.ok || !(payload.images?.[0]?.url || payload.images?.[0]?.dataUrl)) {
+      // 只判断「入队是否成功」；图片由服务端后台生成，对账 effect 负责取回
+      if (!response.ok || !payload.ok) {
         const detail = payload.detail && typeof payload.detail === "object"
           ? (payload.detail as Record<string, unknown>).message || JSON.stringify(payload.detail)
           : payload.detail || "生成失败";
         throw new Error(String(detail));
       }
-      const blob = await generatedImageToBlob(payload.images[0]);
-      const objectUrl = URL.createObjectURL(blob);
-      const { width, height } = await getImageSize(objectUrl);
-      // 画布节点用缩略图渲染：30 节点画布的位图内存从 ~500MB 降到 ~30MB
-      const thumb = await createListThumbnail(blob);
-      const thumbUrl = thumb ? URL.createObjectURL(thumb.blob) : undefined;
-      const duration = Date.now() - startedAt;
-      const nodeW = CANVAS_DEFAULT_NODE_WIDTH;
-      const adjustedH = Math.round(nodeW * (height / width));
-
+      // 入队成功：保持 generating，图片由 useEffect 对账轮询取回并落库。
+      // 这样即使用户此刻关掉页面，服务端也会把它跑完。
       setCanvasNodes((prev) => prev.map((n) =>
-        n.id === node.id ? {
-          ...n,
-          status: "success" as const,
-          objectUrl,
-          thumbUrl,
-          width: nodeW,
-          height: adjustedH,
-          imageWidth: width,
-          imageHeight: height,
-          duration,
-          error: undefined,
-        } : n
-      ));
-      await saveCanvasImageToDB(node.id, blob);
-      if (thumb) await saveCanvasImageToDB(canvasThumbKey(node.id), thumb.blob);
+        n.id === node.id
+          ? { ...n, requestId: payload.requestId || plannedRequestId || n.requestId }
+          : n));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setCanvasNodes((prev) => prev.map((n) =>
         n.id === node.id ? { ...n, status: "error" as const, error: message } : n
       ));
     } finally {
-      setIsGenerating(false);
+      bumpRunning(-1);
     }
   }
 
@@ -10427,6 +10838,14 @@ function CanvasPage({
   }, [apiConfig.protocol, canScale, canvasAspectRatio, canvasModel, canvasResolution, canvasSize]);
 
   // ── Floating toolbar position ──
+  // 只有缩到「512px 缩略图足够覆盖显示像素」时才降级，其余一律原图。
+  // 用离散档位而非连续 zoom，避免每次缩放都让全部节点重渲染。
+  const lodTier: "thumb" | "full" = useMemo(() => {
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    const neededPx = CANVAS_DEFAULT_NODE_WIDTH * viewport.zoom * dpr;
+    return neededPx <= LIST_THUMB_MAX_EDGE * 0.9 ? "thumb" : "full";
+  }, [viewport.zoom]);
+
   const toolbarPos = useMemo(() => {
     if (!selectedNode || !containerRef.current) return null;
     const rect = containerRef.current.getBoundingClientRect();
@@ -10543,10 +10962,90 @@ function CanvasPage({
               node={node}
               selected={selectedNodeId === node.id}
               dragging={isDraggingNodeRef.current && dragStartRef.current.nodeId === node.id}
+              lodTier={lodTier}
               handlersRef={canvasNodeHandlersRef}
             />
           ))}
         </div>
+
+        {/* 右键菜单：第一项「查看原图」，解决画布上看不清细节的问题 */}
+        {contextMenu && !contextMenu.nodeId && (
+          <>
+            <div className="canvas-context-backdrop" onPointerDown={() => setContextMenu(null)} />
+            <div className="canvas-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu">
+              <button
+                type="button"
+                disabled={!canvasPrompt.trim() || canvasAtCapacity}
+                onClick={() => {
+                  const at = { x: contextMenu.canvasX ?? 0, y: contextMenu.canvasY ?? 0 };
+                  setContextMenu(null);
+                  void handleCanvasGenerate({ at });
+                }}
+              >
+                <WandSparkles size={14} /> 在此生成
+                <small>{canvasPrompt.trim() ? "" : "先写提示词"}</small>
+              </button>
+              <button type="button" onClick={() => { setContextMenu(null); fitAllNodes(); }}>
+                <Maximize2 size={14} /> 适应全部 <small>⇧⌘F</small>
+              </button>
+            </div>
+          </>
+        )}
+        {contextMenu?.nodeId && (() => {
+          const node = canvasNodes.find((n) => n.id === contextMenu.nodeId);
+          if (!node) return null;
+          const ok = node.status === "success";
+          return (
+            <>
+              <div className="canvas-context-backdrop" onPointerDown={() => setContextMenu(null)} />
+              <div className="canvas-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu">
+                {ok && (
+                  <button type="button" onClick={() => viewOriginal(node)}>
+                    <Maximize2 size={14} /> 查看原图
+                    <small>{node.imageWidth}×{node.imageHeight}</small>
+                  </button>
+                )}
+                {ok && (
+                  <button type="button" onClick={() => { setContextMenu(null); enterOptimizeMode(node); }}>
+                    <WandSparkles size={14} /> 基于此图优化 <small>E</small>
+                  </button>
+                )}
+                {ok && (
+                  <button type="button" onClick={() => { setContextMenu(null); downloadNode(node); }}>
+                    <Download size={14} /> 下载原图
+                  </button>
+                )}
+                {ok && (
+                  <button type="button" onClick={() => { setContextMenu(null); copyPrompt(node); }}>
+                    <Copy size={14} /> 复制提示词
+                  </button>
+                )}
+                {node.status === "error" && (
+                  <button type="button" onClick={() => { setContextMenu(null); void retryNode(node); }}>
+                    <RefreshCw size={14} /> 重试
+                  </button>
+                )}
+                <button type="button" className="is-danger" onClick={() => { setContextMenu(null); setShowDeleteConfirm(node.id); }}>
+                  <Trash2 size={14} /> 删除 <small>Del</small>
+                </button>
+              </div>
+            </>
+          );
+        })()}
+
+        {/* 原图查看层：画布节点受 LOD 限制，这里始终加载 objectUrl 原图 */}
+        {originalPreview?.objectUrl && (
+          <div className="canvas-original-viewer" onPointerDown={() => setOriginalPreview(null)} role="dialog" aria-label="原图查看">
+            <img src={originalPreview.objectUrl} alt="" />
+            <div className="canvas-original-meta">
+              <span>{originalPreview.model}</span>
+              <span>{originalPreview.imageWidth}×{originalPreview.imageHeight}</span>
+              <button type="button" onClick={() => setOriginalPreview(null)} aria-label="关闭">
+                <X size={16} />
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Empty state */}
         {canvasLoaded && canvasNodes.length === 0 && (
@@ -12254,23 +12753,37 @@ function AgentModeSwitch({
   status: AgentModeStatus;
   onToggle: () => void;
 }) {
+  // 未启用时只留一个 chip：默认关闭的功能不该常驻占两行说明
+  if (!enabled) {
+    return (
+      <button
+        type="button"
+        className="composer-tool-chip"
+        onClick={onToggle}
+        title="开启 Agent 模式 A：自动编排单图、多图与宣传画册"
+      >
+        <Bot size={14} />
+        {AGENT_MODE_NAME}
+      </button>
+    );
+  }
   return (
-    <div className={`agent-mode-switch ${enabled ? "is-on" : "is-off"} status-${status}`}>
+    <div className={`agent-mode-switch is-on status-${status}`}>
       <div className="agent-mode-switch-copy">
         <strong>{AGENT_MODE_NAME}</strong>
-        <span>{enabled ? "理解任务并自动拆解" : "自动编排单图、多图与宣传画册"}</span>
+        <span>理解任务并自动拆解</span>
       </div>
       <button
         type="button"
         role="switch"
         aria-checked={enabled}
-        className={`agent-mode-toggle ${enabled ? "is-on" : "is-off"}`}
+        className="agent-mode-toggle is-on"
         onClick={onToggle}
-        title={enabled ? "关闭 Agent 模式 A" : "开启 Agent 模式 A"}
+        title="关闭 Agent 模式 A"
       >
         <span className="agent-mode-toggle-track">
           <span className="agent-mode-toggle-thumb">
-            {enabled ? <Bot size={14} /> : <WandSparkles size={14} />}
+            <Bot size={14} />
           </span>
         </span>
       </button>

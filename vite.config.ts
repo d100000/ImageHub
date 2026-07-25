@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync,
 import Database from "better-sqlite3";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 import { defineConfig, loadEnv, type PluginOption, type ViteDevServer } from "vite";
 
 const _env = loadEnv("development", process.cwd(), "");
@@ -87,7 +88,7 @@ type AdminUser = {
   updatedAt: number;
 };
 
-type RequestLogStatus = "running" | "success" | "error";
+type RequestLogStatus = "queued" | "running" | "success" | "error";
 type RequestLogType = "image_generation" | "prompt_analysis" | "agent_analysis";
 
 type RequestLog = {
@@ -157,6 +158,8 @@ type SavedImageMeta = {
 
 type RequestStages = {
   receivedAt?: number;
+  // 出队开始执行的时刻。receivedAt→dispatchedAt 是排队等待，不该算进生成耗时
+  dispatchedAt?: number;
   upstreamRequestedAt?: number;
   upstreamRespondedAt?: number;
   imageSavedAt?: number;
@@ -1157,6 +1160,367 @@ function safeErrorSummary(detail: unknown) {
 // ── SQLite 请求/生成记录存储 ──
 const REQUEST_LOG_LIMIT = 5000;
 const THUMBNAIL_MAX_BYTES = 512 * 1024;
+
+// ── 生成任务队列 ──────────────────────────────────────────────
+// 设计约束（已与 owner 确认）：apiKey 与参考图 base64 **只在内存**，进程退出即弃。
+// 这样不违反「Key 永不落盘」的隐私红线，代价是重启后队列不可恢复——
+// 由启动时的 sweepStaleTasks() 把遗留任务判死，前端据此提示重试。
+const GENERATION_MAX_CONCURRENCY = 4;
+const GENERATION_MAX_QUEUE_DEPTH = 200;
+// 排队超过这个时长仍未被执行就判死，防止 backlog 里的任务永远占着 queued
+const GENERATION_QUEUE_TTL_MS = 30 * 60 * 1000;
+
+type QueuedGenerationTask = {
+  requestId: string;
+  clientId: string;
+  imageUserDir: string;
+  baseUrl: string;
+  apiKey: string;
+  protocol: ImageProtocol;
+  request: GenerateRequest;
+  publicBaseUrl: string;
+  referenceCount: number;
+  receivedAt: number;
+  enqueuedAt: number;
+};
+
+const generationQueue: QueuedGenerationTask[] = [];
+let generationRunning = 0;
+
+function generationQueueStats() {
+  return { queued: generationQueue.length, running: generationRunning, capacity: GENERATION_MAX_CONCURRENCY };
+}
+
+// 进程启动时清扫上一轮遗留的 queued/running：内存队列已随进程消失，
+// 这些行若不判死会永远停在非终态——既不进 daily_stats（累加靠 running→终态跳变），
+// 又会让前端无限轮询。
+// 真正执行一个任务。**不依赖 req/res** —— 这是它能被队列在请求结束后调用的前提。
+async function executeGenerationTask(task: QueuedGenerationTask) {
+  const { requestId, receivedAt } = task;
+  const dispatchedAt = Date.now();
+  // 排队等待与生成耗时必须分开计量，否则 P50/P95 会被 backlog 污染
+  updateRequestLog(requestId, {
+    status: "running",
+    stages: { receivedAt, dispatchedAt },
+  });
+
+  try {
+    const upstreamRequestedAt = Date.now();
+    const { protocol, baseUrl, apiKey, request, publicBaseUrl } = task;
+    const result = protocol === "openai-responses"
+      ? await generateOpenAiResponses(baseUrl, apiKey, request, requestId)
+      : protocol === "gemini-native"
+        ? await generateGeminiNative(baseUrl, apiKey, request, requestId)
+        : protocol === "google-imagen"
+          ? await generateImagen(baseUrl, apiKey, request, requestId)
+          : protocol === "stability-core"
+            ? await generateStability(baseUrl, apiKey, request, requestId)
+            : await generateOpenAiCompatible(baseUrl, apiKey, request, requestId, publicBaseUrl);
+
+    const upstreamRespondedAt = Date.now();
+    if (result.ok) {
+      const { saved } = persistGeneratedImages(result.images ?? [], {
+        userDir: task.imageUserDir,
+        requestId,
+      });
+      const imageSavedAt = Date.now();
+      updateRequestLog(requestId, {
+        status: "success",
+        httpStatus: result.status || 200,
+        responseBody: sanitizeForLog({ ok: true, status: result.status, requestId }),
+        referenceUploadStatus: task.referenceCount === 0 ? "none" : "succeeded",
+        finishedAt: imageSavedAt,
+        // 从出队算起才是真实生成耗时
+        durationMs: imageSavedAt - dispatchedAt,
+        imageSaved: saved.length > 0,
+        savedImages: saved,
+        stages: { receivedAt, dispatchedAt, upstreamRequestedAt, upstreamRespondedAt, imageSavedAt, returnedAt: imageSavedAt },
+      });
+      return;
+    }
+
+    const summary = safeErrorSummary(result.detail);
+    updateRequestLog(requestId, {
+      status: "error",
+      httpStatus: result.status || 500,
+      errorMessage: summary.message,
+      errorType: summary.type,
+      errorCode: summary.code,
+      errorRaw: summary.raw,
+      errorFull: summary.full,
+      responseBody: sanitizeForLog(result),
+      referenceUploadStatus: task.referenceCount === 0 ? "none" : "failed",
+      finishedAt: upstreamRespondedAt,
+      durationMs: upstreamRespondedAt - dispatchedAt,
+      stages: { receivedAt, dispatchedAt, upstreamRequestedAt, upstreamRespondedAt },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const causeError = (error as { cause?: unknown })?.cause;
+    const causeMessage = causeError instanceof Error ? causeError.message : "";
+    const summaryMessage = causeMessage && causeMessage !== message ? `${message}（${causeMessage}）` : message;
+    const finishedAt = Date.now();
+    updateRequestLog(requestId, {
+      status: "error",
+      httpStatus: 500,
+      errorMessage: truncateText(summaryMessage, 800),
+      errorType: "proxy_error",
+      errorRaw: redactImageText(summaryMessage, 2500),
+      errorFull: redactImageText(describeError(error), 60000),
+      responseBody: sanitizeForLog({ ok: false, detail: { error: summaryMessage } }),
+      referenceUploadStatus: "failed",
+      finishedAt,
+      durationMs: finishedAt - dispatchedAt,
+    });
+  }
+}
+
+function pumpGenerationQueue() {
+  while (generationRunning < GENERATION_MAX_CONCURRENCY && generationQueue.length > 0) {
+    const task = generationQueue.shift();
+    if (!task) break;
+    // 排队太久的直接判死，不再打上游（用户多半已经放弃了）
+    if (Date.now() - task.enqueuedAt > GENERATION_QUEUE_TTL_MS) {
+      const finishedAt = Date.now();
+      updateRequestLog(task.requestId, {
+        status: "error",
+        httpStatus: 504,
+        errorMessage: "任务排队超时未执行",
+        errorType: "queue_timeout",
+        finishedAt,
+        durationMs: finishedAt - task.receivedAt,
+      });
+      continue;
+    }
+    generationRunning += 1;
+    void executeGenerationTask(task).finally(() => {
+      generationRunning -= 1;
+      pumpGenerationQueue();
+    });
+  }
+}
+
+function sweepStaleTasks() {
+  try {
+    const rows = getDb()
+      .prepare("SELECT data FROM request_logs WHERE status IN ('queued','running')")
+      .all() as Array<{ data: string }>;
+    let swept = 0;
+    for (const row of rows) {
+      try {
+        const log = JSON.parse(row.data) as RequestLog;
+        if (!log?.requestId) continue;
+        const finishedAt = Date.now();
+        updateRequestLog(log.requestId, {
+          status: "error",
+          httpStatus: 503,
+          errorMessage: "服务重启，任务已中断，请重新生成",
+          errorType: "server_restarted",
+          finishedAt,
+          durationMs: finishedAt - (log.startedAt || log.createdAt || finishedAt),
+        });
+        swept += 1;
+      } catch { /* 跳过损坏行 */ }
+    }
+    if (swept > 0) console.log(`[queue] 已清扫 ${swept} 条重启前未完成的任务`);
+  } catch (error) {
+    console.warn("[queue] 清扫遗留任务失败:", error);
+  }
+}
+
+// ── 管理员登录加固：滑块验证 + 失败限流 ──────────────────────────────
+// 滑块本身只是抬高自动化成本，真正防爆破的是下面的失败计数与锁定。
+// 校验必须在服务端做：只在前端判断等于没做，攻击者直接打 API 即可绕过。
+const CAPTCHA_TTL_MS = 3 * 60 * 1000;
+const CAPTCHA_TOLERANCE_PX = 8;
+const CAPTCHA_TRACK_WIDTH = 300;
+const CAPTCHA_PIECE_SIZE = 42;
+type CaptchaChallenge = { gapX: number; expiresAt: number; issuedAt: number };
+const captchaChallenges = new Map<string, CaptchaChallenge>();
+
+// 失败限流：按「IP + 用户名」聚合，两者任一被锁都拒绝
+const LOGIN_FAIL_WINDOW_MS = 10 * 60 * 1000;
+const LOGIN_MAX_FAILS = 5;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+const LOGIN_CAPTCHA_AFTER = 1; // 失败 1 次后强制滑块
+type LoginAttempt = { fails: number; firstFailAt: number; lockedUntil: number };
+const loginAttempts = new Map<string, LoginAttempt>();
+
+function cleanupSecurityMaps() {
+  const now = Date.now();
+  for (const [key, item] of captchaChallenges) {
+    if (item.expiresAt < now) captchaChallenges.delete(key);
+  }
+  for (const [key, item] of loginAttempts) {
+    if (item.lockedUntil < now && now - item.firstFailAt > LOGIN_FAIL_WINDOW_MS) loginAttempts.delete(key);
+  }
+}
+
+function clientIpKey(req: IncomingMessage) {
+  const raw = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "");
+  return createHash("sha256").update(raw.split(",")[0].trim()).digest("hex").slice(0, 16);
+}
+
+// 手写 PNG 编码（node:zlib 内置，零依赖）。目的是让缺口位置只存在于**像素**里：
+// 若把 gapX 放进 JSON 下发，攻击者读一次响应就拿到答案，滑块等于没做。
+function pngCrc32(buf: Buffer) {
+  let c = ~0;
+  for (let i = 0; i < buf.length; i++) {
+    c ^= buf[i];
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+  }
+  return ~c >>> 0;
+}
+
+function pngChunk(type: string, data: Buffer) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(pngCrc32(body), 0);
+  return Buffer.concat([len, body, crc]);
+}
+
+function encodePng(width: number, height: number, rgba: Buffer) {
+  const stride = width * 4;
+  const raw = Buffer.alloc((stride + 1) * height);
+  for (let y = 0; y < height; y++) {
+    raw[y * (stride + 1)] = 0; // filter: none
+    rgba.copy(raw, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;  // bit depth
+  ihdr[9] = 6;  // color type RGBA
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", deflateSync(raw, { level: 6 })),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+const CAPTCHA_BG_HEIGHT = 100;
+
+// 生成「带缺口的背景图」+「拼图块」两张 PNG
+function renderCaptchaImages(gapX: number, gapY: number, size: number) {
+  const w = CAPTCHA_TRACK_WIDTH;
+  const h = CAPTCHA_BG_HEIGHT;
+  const bg = Buffer.alloc(w * h * 4);
+  const rnd = randomBytes(64);
+  // 随机彩色斑块做底，保证每次图案不同，避免被模板匹配
+  const blobs = Array.from({ length: 10 }, (_, i) => ({
+    cx: (rnd[i * 4] / 255) * w,
+    cy: (rnd[i * 4 + 1] / 255) * h,
+    r: 18 + (rnd[i * 4 + 2] / 255) * 46,
+    hue: (rnd[i * 4 + 3] / 255) * 360,
+  }));
+  const hsl = (hue: number, s: number, l: number) => {
+    const a = s * Math.min(l, 1 - l);
+    const f = (n: number) => {
+      const k = (n + hue / 30) % 12;
+      return l - a * Math.max(-1, Math.min(Math.min(k - 3, 9 - k), 1));
+    };
+    return [f(0) * 255, f(8) * 255, f(4) * 255];
+  };
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let r = 236, g = 234, b = 226;
+      for (const bl of blobs) {
+        const d = Math.hypot(x - bl.cx, y - bl.cy);
+        if (d < bl.r) {
+          const t = 1 - d / bl.r;
+          const [cr, cg, cb] = hsl(bl.hue, 0.5, 0.62);
+          r = r * (1 - t * 0.7) + cr * t * 0.7;
+          g = g * (1 - t * 0.7) + cg * t * 0.7;
+          b = b * (1 - t * 0.7) + cb * t * 0.7;
+        }
+      }
+      const i = (y * w + x) * 4;
+      bg[i] = r; bg[i + 1] = g; bg[i + 2] = b; bg[i + 3] = 255;
+    }
+  }
+  // 裁出拼图块，再把原位挖暗
+  const piece = Buffer.alloc(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const sx = gapX + x;
+      const sy = gapY + y;
+      const di = (y * size + x) * 4;
+      if (sx >= w || sy >= h) { piece[di + 3] = 0; continue; }
+      const si = (sy * w + sx) * 4;
+      piece[di] = bg[si]; piece[di + 1] = bg[si + 1]; piece[di + 2] = bg[si + 2]; piece[di + 3] = 255;
+      bg[si] = bg[si] * 0.28; bg[si + 1] = bg[si + 1] * 0.28; bg[si + 2] = bg[si + 2] * 0.28;
+    }
+  }
+  return {
+    background: `data:image/png;base64,${encodePng(w, h, bg).toString("base64")}`,
+    piece: `data:image/png;base64,${encodePng(size, size, piece).toString("base64")}`,
+  };
+}
+
+function issueCaptcha() {
+  cleanupSecurityMaps();
+  const token = randomBytes(18).toString("hex");
+  // 缺口留出左右边距，避免出现在极端位置让人拖不到
+  const min = 60;
+  const max = CAPTCHA_TRACK_WIDTH - CAPTCHA_PIECE_SIZE - 10;
+  const gapX = min + Math.floor((randomBytes(2).readUInt16BE(0) / 65536) * (max - min));
+  const gapY = 10 + Math.floor((randomBytes(2).readUInt16BE(0) / 65536) * 46);
+  captchaChallenges.set(token, { gapX, expiresAt: Date.now() + CAPTCHA_TTL_MS, issuedAt: Date.now() });
+  const images = renderCaptchaImages(gapX, gapY, CAPTCHA_PIECE_SIZE);
+  // 响应里没有 gapX：答案只在 background 图的暗色缺口像素中
+  return { token, gapY, trackWidth: CAPTCHA_TRACK_WIDTH, pieceSize: CAPTCHA_PIECE_SIZE, ...images };
+}
+
+function verifyCaptcha(token: string, x: number): { ok: boolean; error?: string } {
+  const item = captchaChallenges.get(token);
+  // 一次性：无论成败都立即销毁，杜绝同一 token 反复试位置
+  captchaChallenges.delete(token);
+  if (!item) return { ok: false, error: "验证已失效，请重新拖动滑块" };
+  if (item.expiresAt < Date.now()) return { ok: false, error: "验证已超时，请重新拖动滑块" };
+  // 人类拖动不可能快于 ~200ms，机器直接提交答案会被这条挡下
+  if (Date.now() - item.issuedAt < 200) return { ok: false, error: "验证异常，请重试" };
+  if (!Number.isFinite(x) || Math.abs(x - item.gapX) > CAPTCHA_TOLERANCE_PX) {
+    return { ok: false, error: "拼图未对齐，请重试" };
+  }
+  return { ok: true };
+}
+
+function loginGateState(ipKey: string, username: string) {
+  cleanupSecurityMaps();
+  const now = Date.now();
+  const keys = [`ip:${ipKey}`, `user:${username.toLowerCase()}`];
+  let lockedUntil = 0;
+  let fails = 0;
+  for (const key of keys) {
+    const item = loginAttempts.get(key);
+    if (!item) continue;
+    if (now - item.firstFailAt > LOGIN_FAIL_WINDOW_MS && item.lockedUntil < now) continue;
+    lockedUntil = Math.max(lockedUntil, item.lockedUntil);
+    fails = Math.max(fails, item.fails);
+  }
+  return { lockedUntil, fails, captchaRequired: fails >= LOGIN_CAPTCHA_AFTER };
+}
+
+function recordLoginFail(ipKey: string, username: string) {
+  const now = Date.now();
+  for (const key of [`ip:${ipKey}`, `user:${username.toLowerCase()}`]) {
+    const item = loginAttempts.get(key);
+    if (!item || now - item.firstFailAt > LOGIN_FAIL_WINDOW_MS) {
+      loginAttempts.set(key, { fails: 1, firstFailAt: now, lockedUntil: 0 });
+      continue;
+    }
+    item.fails += 1;
+    if (item.fails >= LOGIN_MAX_FAILS) item.lockedUntil = now + LOGIN_LOCK_MS;
+  }
+}
+
+function clearLoginFails(ipKey: string, username: string) {
+  loginAttempts.delete(`ip:${ipKey}`);
+  loginAttempts.delete(`user:${username.toLowerCase()}`);
+}
 let sqliteDb: Database.Database | null = null;
 
 function getDb(): Database.Database {
@@ -1241,8 +1605,15 @@ function getDb(): Database.Database {
   } catch {
     // 回填失败不阻断启动
   }
+  // 内存队列随进程消失，上一轮遗留的 queued/running 必须判死，
+  // 否则既不进 daily_stats（累加靠 running→终态跳变），前端也会无限轮询
+  if (!staleSwept) {
+    staleSwept = true;  // sqliteDb 已在上面赋值，sweepStaleTasks 内的 getDb() 不会递归
+    sweepStaleTasks();
+  }
   return db;
 }
+let staleSwept = false;
 
 // 请求到达终态时累加当日聚合（date + model 维度）
 function bumpDailyStats(log: RequestLog) {
@@ -4119,6 +4490,86 @@ export function registerApiRoutes(app: ApiApp) {
         }
       });
 
+      // 任务找回：服务端 handler 不会因客户端断开而中止，图其实已经生成并落盘了，
+      // 缺的只是让前端查回来的途径。request_logs 本身就具备任务表的全部字段，无需新表。
+      app.use("/api/tasks", (req, res) => {
+        if (req.method !== "GET") {
+          sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        try {
+          const q = new URLSearchParams((req.url || "").split("?")[1] || "");
+          const clientId = (q.get("clientId") || "").trim();
+          if (!clientId) {
+            sendJson(res, 400, { ok: false, error: "缺少 clientId" });
+            return;
+          }
+          const since = Number(q.get("since")) || Date.now() - 24 * 60 * 60 * 1000;
+          const ids = (q.get("ids") || "").split(",").map((v) => v.trim()).filter(Boolean).slice(0, 100);
+
+          // 按 clientId 取最近的生成任务；ids 非空时额外把这些明确要查的补进来
+          const rows = getDb()
+            .prepare(
+              `SELECT data FROM request_logs
+               WHERE client_id = ? AND request_type = 'image_generation' AND created_at >= ?
+               ORDER BY created_at DESC LIMIT 200`,
+            )
+            .all(clientId, since) as Array<{ data: string }>;
+          const byId = new Map<string, RequestLog>();
+          for (const row of rows) {
+            try {
+              const log = JSON.parse(row.data) as RequestLog;
+              if (log?.requestId) byId.set(log.requestId, log);
+            } catch { /* 跳过损坏行 */ }
+          }
+          for (const id of ids) {
+            if (byId.has(id)) continue;
+            const log = readRequestLogRecord(id);
+            // 明确指名要查的任务，也必须是自己的
+            if (log && log.clientId === clientId) byId.set(id, log);
+          }
+
+          // 异步化后这里是前端恢复记录的唯一数据源，字段必须够用：
+          // 脉冲线要 stages、批次重组要 batchId、广场推荐要 params/尺寸、Agent 卡片要 agent*
+          const tasks = [...byId.values()].map((log) => ({
+            requestId: log.requestId,
+            status: log.status,
+            model: log.model,
+            protocol: log.protocol,
+            prompt: log.prompt,
+            negativePrompt: log.negativePrompt,
+            createdAt: log.createdAt,
+            durationMs: log.durationMs,
+            stages: log.stages,
+            batchId: log.batchId,
+            batchIndex: log.batchIndex,
+            batchTotal: log.batchTotal,
+            agentId: log.agentId,
+            agentName: log.agentName,
+            agentScenario: log.agentScenario,
+            promptVariant: log.promptVariant,
+            params: {
+              aspectRatio: log.aspectRatio,
+              size: log.size,
+              resolution: log.resolution,
+              quality: log.quality,
+              outputFormat: log.outputFormat,
+              seed: log.seed,
+            },
+            errorMessage: log.status === "error" ? log.errorMessage : undefined,
+            errorType: log.status === "error" ? log.errorType : undefined,
+            images: (log.savedImages || []).map((img) => ({
+              url: `${LOCAL_IMAGE_URL_PREFIX}${img.id}`,
+              thumbUrl: img.thumbId ? `${LOCAL_IMAGE_URL_PREFIX}${img.thumbId}` : undefined,
+              bytes: img.bytes,
+            })),
+          }));
+          sendJson(res, 200, { ok: true, tasks, serverTime: Date.now() });
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+        }
+      });
+
       app.use("/api/feedback", async (req, res) => {
         if (req.method !== "POST") {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
@@ -4411,18 +4862,65 @@ export function registerApiRoutes(app: ApiApp) {
         const store = readAdminStore();
 
         try {
+          // 登录前置：告诉前端当前是否需要滑块、是否已被锁定
+          if (path === "/login-state" && req.method === "GET") {
+            const loginStateQuery = new URLSearchParams((req.url || "").split("?")[1] || "");
+            const gate = loginGateState(clientIpKey(req), loginStateQuery.get("username") || "");
+            sendJson(res, 200, {
+              ok: true,
+              captchaRequired: gate.captchaRequired,
+              lockedUntil: gate.lockedUntil > Date.now() ? gate.lockedUntil : 0,
+            });
+            return;
+          }
+
+          if (path === "/captcha" && req.method === "GET") {
+            sendJson(res, 200, { ok: true, ...issueCaptcha() });
+            return;
+          }
+
           if (path === "/login" && req.method === "POST") {
             const body = await readJsonBody(req);
             const username = getString(body, "username");
             const password = getString(body, "password");
-            const user = store.admins.find((admin) => admin.username === username);
-            if (!user || !verifyPassword(password, user)) {
-              sendJson(res, 401, { ok: false, error: "账号或密码错误" });
+            const ipKey = clientIpKey(req);
+            const gate = loginGateState(ipKey, username);
+
+            if (gate.lockedUntil > Date.now()) {
+              const mins = Math.ceil((gate.lockedUntil - Date.now()) / 60000);
+              appendAuditLog(username || "(unknown)", "admin_login_locked", `ip=${ipKey}`);
+              sendJson(res, 429, { ok: false, error: `尝试过于频繁，请 ${mins} 分钟后再试`, lockedUntil: gate.lockedUntil });
               return;
             }
+
+            if (gate.captchaRequired) {
+              const verdict = verifyCaptcha(getString(body, "captchaToken"), Number(body.captchaX));
+              if (!verdict.ok) {
+                // 滑块失败不计入密码失败次数，否则拖错几次就把自己锁死
+                sendJson(res, 400, { ok: false, error: verdict.error, captchaRequired: true });
+                return;
+              }
+            }
+
+            const user = store.admins.find((admin) => admin.username === username);
+            if (!user || !verifyPassword(password, user)) {
+              // 用户名不存在时也跑一次等价的 scrypt，抹平时序差，避免被用来枚举用户名
+              if (!user) scryptSync(password || "x", "timing-equalizer-salt", 64);
+              recordLoginFail(ipKey, username);
+              const next = loginGateState(ipKey, username);
+              appendAuditLog(username || "(unknown)", "admin_login_failed", `ip=${ipKey} fails=${next.fails}`);
+              sendJson(res, 401, {
+                ok: false,
+                error: "账号或密码错误",
+                captchaRequired: next.captchaRequired,
+                remainingAttempts: Math.max(0, LOGIN_MAX_FAILS - next.fails),
+              });
+              return;
+            }
+            clearLoginFails(ipKey, username);
             const token = createSession(user.username);
             setSessionCookie(res, token);
-            appendAuditLog(user.username, "admin_login");
+            appendAuditLog(user.username, "admin_login", `ip=${ipKey}`);
             sendJson(res, 200, {
               ok: true,
               user: {
@@ -4594,7 +5092,10 @@ export function registerApiRoutes(app: ApiApp) {
                 success,
                 error,
                 running: imageRows.filter((r) => r.status === "running").length,
-                successRate: imageRows.length ? Math.round((success / imageRows.length) * 1000) / 10 : 0,
+                queued: imageRows.filter((r) => r.status === "queued").length,
+                // 成功率只在已完成的任务里算：排队/执行中的任务还没有结果，
+                // 计进分母会让成功率随 backlog 起伏而失真
+                successRate: (success + error) ? Math.round((success / (success + error)) * 1000) / 10 : 0,
                 avgDurationMs,
                 p50DurationMs,
                 p95DurationMs,
@@ -5172,11 +5673,18 @@ export function registerApiRoutes(app: ApiApp) {
           sendJson(res, 405, { ok: false, error: "Method not allowed" });
           return;
         }
-        const requestId = randomUUID();
+        let requestId: string = randomUUID();
         const startedAt = Date.now();
         let logCreated = false;
         try {
           const body = await readJsonBody(req);
+          // 允许客户端预先指定 requestId：前端在发请求前就知道任务 ID，
+          // 页面关闭后才能靠它去 /api/tasks 把结果找回来。
+          // 严格校验 UUID 格式且必须未被占用，避免覆盖他人记录。
+          const wanted = getString(body, "requestId");
+          if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(wanted) && !readRequestLogRecord(wanted)) {
+            requestId = wanted;
+          }
           const baseUrl = normalizeAllowedApiBaseUrl(getString(body, "baseUrl"));
           const apiKey = getString(body, "apiKey");
           const publicBaseUrl = publicBaseUrlFromRequest(req);
@@ -5242,7 +5750,7 @@ export function registerApiRoutes(app: ApiApp) {
               apiKey: undefined,
               credential: apiKeyLogMeta(apiKey),
             }),
-            status: "running",
+            status: "queued",
             createdAt: startedAt,
             startedAt,
             imageSaved: false,
@@ -5307,68 +5815,38 @@ export function registerApiRoutes(app: ApiApp) {
             }
           }
 
-          const upstreamRequestedAt = Date.now();
-          const result = protocol === "openai-responses"
-            ? await generateOpenAiResponses(baseUrl, apiKey, request, requestId)
-            : protocol === "gemini-native"
-              ? await generateGeminiNative(baseUrl, apiKey, request, requestId)
-              : protocol === "google-imagen"
-                ? await generateImagen(baseUrl, apiKey, request, requestId)
-                : protocol === "stability-core"
-                  ? await generateStability(baseUrl, apiKey, request, requestId)
-                  : await generateOpenAiCompatible(baseUrl, apiKey, request, requestId, publicBaseUrl);
-
-          const upstreamRespondedAt = Date.now();
-          const finishedAt = upstreamRespondedAt;
-          const durationMs = finishedAt - startedAt;
-          if (result.ok) {
-            const { saved, publicImages } = persistGeneratedImages(result.images ?? [], { userDir: imageUserDir, requestId });
-            const imageSavedAt = Date.now();
-            const returnedAt = Date.now();
-            const responsePayload = {
-              ok: true,
-              status: result.status,
-              images: publicImages,
-              raw: sanitizeForLog(result.raw),
-              requestId,
-              // 链路阶段时间戳：前端脉冲线用它渲染各环节真实耗时占比
-              stages: { receivedAt: startedAt, upstreamRequestedAt, upstreamRespondedAt, imageSavedAt, returnedAt },
-            };
-            updateRequestLog(requestId, {
-              status: "success",
-              httpStatus: result.status || 200,
-              responseBody: sanitizeForLog(responsePayload),
-              referenceUploadStatus: incomingRefs.length === 0 ? "none" : "succeeded",
-              finishedAt: returnedAt,
-              durationMs: returnedAt - startedAt,
-              imageSaved: saved.length > 0,
-              savedImages: saved,
-              stages: { receivedAt: startedAt, upstreamRequestedAt, upstreamRespondedAt, imageSavedAt, returnedAt },
-            });
-            sendJson(res, 200, responsePayload);
+          // 入队而非直接执行：请求到此立即返回，生成在服务端后台进行。
+          // 这样关闭页面不再影响生成，前端凭 requestId 去 /api/tasks 取结果。
+          if (generationQueue.length >= GENERATION_MAX_QUEUE_DEPTH) {
+            failFast(503, "服务端任务队列已满，请稍后再试");
             return;
           }
-
-          const summary = safeErrorSummary(result.detail);
-          updateRequestLog(requestId, {
-            status: "error",
-            httpStatus: result.status || 500,
-            errorMessage: summary.message,
-            errorType: summary.type,
-            errorCode: summary.code,
-            errorRaw: summary.raw,
-            errorFull: summary.full,
-            responseBody: sanitizeForLog(result),
-            referenceUploadStatus: incomingRefs.length === 0 ? "none" : "failed",
-            finishedAt,
-            durationMs,
-            stages: { receivedAt: startedAt, upstreamRequestedAt, upstreamRespondedAt },
-          });
-
-          sendJson(res, result.status || 500, {
-            ...result,
+          const enqueuedAt = Date.now();
+          generationQueue.push({
             requestId,
-            stages: { receivedAt: startedAt, upstreamRequestedAt, upstreamRespondedAt },
+            clientId: truncateText(clientId, 120),
+            imageUserDir,
+            baseUrl,
+            apiKey,
+            protocol,
+            request,
+            publicBaseUrl,
+            referenceCount: incomingRefs.length,
+            receivedAt: startedAt,
+            enqueuedAt,
+          });
+          updateRequestLog(requestId, {
+            status: "queued",
+            stages: { receivedAt: startedAt },
+          });
+          pumpGenerationQueue();
+
+          sendJson(res, 202, {
+            ok: true,
+            requestId,
+            status: "queued",
+            queue: generationQueueStats(),
+            stages: { receivedAt: startedAt },
           });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);

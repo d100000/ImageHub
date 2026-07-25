@@ -8587,3 +8587,242 @@ textarea:focus-visible {
     transform: translateX(100%);
   }
 }
+
+/* ── 管理员登录滑块验证 ────────────────────────────── */
+.captcha-box {
+  display: grid;
+  gap: 10px;
+}
+
+.captcha-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 96px;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.captcha-stage {
+  position: relative;
+  height: 100px;
+  border-radius: var(--r-card);
+  overflow: hidden;
+  background: linear-gradient(135deg, var(--surface-soft), var(--overlay-2));
+  border: 1px solid var(--border);
+}
+
+.captcha-bg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  user-select: none;
+}
+
+.captcha-piece {
+  position: absolute;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(22, 21, 15, 0.4);
+  user-select: none;
+  transition: box-shadow var(--dur-fast) var(--ease);
+}
+
+.captcha-piece.is-solved {
+  box-shadow: 0 0 0 2px var(--green);
+}
+
+.captcha-track {
+  position: relative;
+  height: 38px;
+  border-radius: var(--r-pill);
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.captcha-hint {
+  color: var(--muted-soft);
+  font-size: 12px;
+  user-select: none;
+  pointer-events: none;
+}
+
+.captcha-handle {
+  position: absolute;
+  top: 2px;
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 32px;
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  cursor: grab;
+  touch-action: none;
+  transition: background var(--dur-fast) var(--ease);
+}
+
+.captcha-handle.is-dragging {
+  cursor: grabbing;
+  background: var(--overlay-1);
+}
+
+.captcha-handle.is-solved {
+  background: var(--green);
+  color: #fff;
+  border-color: var(--green);
+}
+
+.captcha-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--red);
+  font-size: 12px;
+}
+
+.captcha-error button {
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* ── Composer 收起态：未启用的功能只留 chip，点开才展开 ────────── */
+.composer-tool-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.composer-tool-chip:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.composer-tool-chip svg.is-open {
+  transform: rotate(90deg);
+}
+
+.composer-tool-chip svg {
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+.composer-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ── 画布右键菜单与原图查看 ────────────────────────── */
+.canvas-context-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+}
+
+.canvas-context-menu {
+  position: fixed;
+  z-index: 201;
+  min-width: 190px;
+  padding: 5px;
+  border-radius: var(--r-card);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-popover);
+  display: grid;
+  gap: 1px;
+}
+
+.canvas-context-menu button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  border-radius: var(--r-input);
+  background: none;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease);
+}
+
+.canvas-context-menu button:hover {
+  background: var(--overlay-1);
+}
+
+.canvas-context-menu button.is-danger {
+  color: var(--red);
+}
+
+.canvas-context-menu small {
+  margin-left: auto;
+  color: var(--muted-soft);
+  font-size: 11px;
+}
+
+.canvas-original-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 210;
+  display: grid;
+  place-items: center;
+  padding: 40px;
+  background: rgba(10, 10, 8, 0.88);
+  cursor: zoom-out;
+}
+
+.canvas-original-viewer img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: var(--r-card);
+}
+
+.canvas-original-meta {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 8px 6px 14px;
+  border-radius: var(--r-pill);
+  background: rgba(245, 244, 239, 0.1);
+  color: #f5f4ef;
+  font-size: 12px;
+}
+
+.canvas-original-meta button {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: rgba(245, 244, 239, 0.14);
+  color: #f5f4ef;
+  cursor: pointer;
+}
